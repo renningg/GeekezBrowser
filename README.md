@@ -17,6 +17,8 @@
 
 ## 📖 Introduction
 
+> **⚙️ Fork note (`local-build` branch):** this branch carries two proxy fixes on top of upstream (Xray 26.x `allowInsecure` removal, and relaxed readiness-probe timeouts) plus a local packaging tweak. See [`LOCAL_BUILD.md`](LOCAL_BUILD.md) for the change list and build/install instructions.
+
 **GeekEZ Browser** is a fingerprint browser with integrated Xray proxy support.
 
 It is designed to solve multi-account association issues in cross-border e-commerce (TikTok, Amazon, Facebook, Shopee, etc.). Through deep spoofing, it can pass high-intensity checks from Cloudflare, Pixelscan, and BrowserScan.
