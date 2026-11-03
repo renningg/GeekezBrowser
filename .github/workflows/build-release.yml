@@ -9,7 +9,7 @@ permissions:
   contents: write
 
 env:
-  XRAY_FALLBACK_VERSION: 'v26.3.27'
+  XRAY_FALLBACK_VERSION: 'v26.10.31'
   ELECTRON_BUILDER_CACHE: ${{ github.workspace }}/.cache/electron-builder
 
 jobs:
@@ -43,7 +43,7 @@ jobs:
             xray_asset: Xray-windows-arm64-v8a.zip
             build_cmd: npm run build && npx electron-builder --win nsis zip --arm64
           # Linux x64
-          - platform: ubuntu-latest
+          - platform: ubuntu-22.04
             os: linux
             arch: x64
             xray_asset: Xray-linux-64.zip
@@ -90,35 +90,70 @@ jobs:
           [ "${{ matrix.os }}" != "win32" ] && chmod +x "$BIN_DIR/xray" || true
 
       - name: Download Chrome
-        run: npx @puppeteer/browsers install chrome@147.0.7727.50 --path resources/puppeteer
+        if: matrix.os != 'linux' || matrix.arch != 'arm64'
+        run: npx @puppeteer/browsers install chrome@150.0.7871.115 --path resources/puppeteer
 
-      - name: Build
+      - name: Download Chrome Beta ARM64
+        if: matrix.os == 'linux' && matrix.arch == 'arm64'
+        shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ matrix.os }}" = "darwin" ]; then
-            npm run build
-            for attempt in 1 2 3; do
-              if [ "$attempt" -eq 2 ]; then
-                export ELECTRON_BUILDER_BINARIES_MIRROR="https://ghproxy.com/https://github.com/"
-                echo "macOS build retry #$attempt: using proxy mirror for dmg-builder download."
-              fi
-              set +e
-              npx electron-builder --mac
-              code=$?
-              set -e
-              if [ "$code" -eq 0 ]; then
-                break
-              fi
-              if [ "$attempt" -eq 3 ]; then
-                exit "$code"
-              fi
-              echo "::warning::macOS build attempt $attempt failed (exit=$code), retrying after cache clear."
-              rm -rf "$ELECTRON_BUILDER_CACHE/downloads"
-              sleep 12
-            done
-          else
-            ${{ matrix.build_cmd }}
-          fi
+          BUILD_ID='153.0.8010.5'
+          ROOT="resources/puppeteer/chrome/linux_arm64-$BUILD_ID"
+          mkdir -p "$ROOT"
+          curl -fL --retry 3 -o /tmp/chrome-linux-arm64.zip \
+            "https://storage.googleapis.com/chrome-for-testing-public/$BUILD_ID/linux-arm64/chrome-linux-arm64.zip"
+          unzip -q /tmp/chrome-linux-arm64.zip -d "$ROOT"
+          rm -f /tmp/chrome-linux-arm64.zip
+          chmod +x "$ROOT/chrome-linux-arm64/chrome"
+
+      - name: Build macOS
+        if: matrix.os == 'darwin'
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run build
+          for attempt in 1 2 3; do
+            if [ "$attempt" -eq 2 ]; then
+              export ELECTRON_BUILDER_BINARIES_MIRROR="https://ghproxy.com/https://github.com/"
+              echo "macOS build retry #$attempt: using proxy mirror for dmg-builder download."
+            fi
+            set +e
+            npx electron-builder --mac
+            code=$?
+            set -e
+            if [ "$code" -eq 0 ]; then
+              break
+            fi
+            if [ "$attempt" -eq 3 ]; then
+              exit "$code"
+            fi
+            echo "::warning::macOS build attempt $attempt failed (exit=$code), retrying after cache clear."
+            rm -rf "$ELECTRON_BUILDER_CACHE/downloads"
+            sleep 12
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+
+      - name: Build Windows
+        if: matrix.os == 'win32'
+        shell: pwsh
+        run: |
+          npm run build
+          if ("${{ matrix.arch }}" -eq "arm64") {
+            npx electron-builder --win nsis zip --arm64
+          } else {
+            npx electron-builder --win nsis zip --x64
+          }
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CSC_IDENTITY_AUTO_DISCOVERY: false
+
+      - name: Build Linux
+        if: matrix.os == 'linux'
+        shell: bash
+        run: ${{ matrix.build_cmd }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CSC_IDENTITY_AUTO_DISCOVERY: false
@@ -130,6 +165,17 @@ jobs:
           for file in dist/*.zip; do
             if [ -f "$file" ]; then
               mv "$file" "${file%.zip}-portable.zip"
+            fi
+          done
+
+      - name: Normalize Linux AppImage name
+        if: matrix.os == 'linux' && matrix.arch == 'x64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in dist/*-x64.AppImage; do
+            if [ -f "$file" ]; then
+              mv "$file" "${file%-x64.AppImage}-x86_64.AppImage"
             fi
           done
 

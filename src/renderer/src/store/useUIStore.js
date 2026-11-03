@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia';
 import { ref } from 'vue';
 import { ipcService } from '../services/ipc.service';
+import { resolveConfiguredLanguage } from '../utils/language';
 
 export const useUIStore = defineStore('ui', () => {
     // Modal visibility states
@@ -22,7 +23,8 @@ export const useUIStore = defineStore('ui', () => {
     
     // UI Theme & Lang
     const theme = ref(localStorage.getItem('geekez_theme') || 'geek');
-    const lang = ref(localStorage.getItem('geekez_lang') || 'cn');
+    const storedLanguage = localStorage.getItem('geekez_lang');
+    const lang = ref(resolveConfiguredLanguage(storedLanguage, navigator.language));
 
     // Dialog messages
     const alertMsg = ref('');
@@ -93,7 +95,8 @@ export const useUIStore = defineStore('ui', () => {
     const openSettings = () => { settingsModalVisible.value = true; };
     const closeSettings = () => { settingsModalVisible.value = false; };
 
-    const setTheme = (newTheme) => {
+    const setTheme = (newTheme, persist = true) => {
+        if (!['geek', 'light', 'dark', 'tech-gray'].includes(newTheme)) return;
         theme.value = newTheme;
         document.body.setAttribute('data-theme', newTheme);
         localStorage.setItem('geekez_theme', newTheme);
@@ -101,21 +104,26 @@ export const useUIStore = defineStore('ui', () => {
         const themeColors = {
             'geek': { bg: '#1e1e2d', symbol: '#ffffff' },
             'light': { bg: '#f0f2f5', symbol: '#000000' },
-            'dark': { bg: '#121212', symbol: '#ffffff' }
+            'dark': { bg: '#121212', symbol: '#ffffff' },
+            'tech-gray': { bg: '#eef8ff', symbol: '#1b2a40' }
         };
         const colors = themeColors[newTheme] || themeColors['geek'];
         ipcService.setTitleBarColor(colors);
+        if (persist) ipcService.saveSettings({ theme: newTheme })
+            .catch(e => console.warn('[UIStore] Failed to persist theme:', e));
     };
 
-    const toggleLang = () => {
-        const newLang = lang.value === 'cn' ? 'en' : 'cn';
-        lang.value = newLang;
-        localStorage.setItem('geekez_lang', newLang);
-        ipcService.getSettings()
-            .then((settings) => ipcService.saveSettings({ ...(settings || {}), lang: newLang }))
+    const setLanguage = (newLang, persist = true, systemLocale = navigator.language) => {
+        if (!['cn', 'en', 'auto'].includes(newLang)) return;
+        const effectiveLanguage = resolveConfiguredLanguage(newLang, systemLocale);
+        lang.value = effectiveLanguage;
+        window.curLang = effectiveLanguage;
+        if (newLang === 'auto') localStorage.removeItem('geekez_lang');
+        else localStorage.setItem('geekez_lang', newLang);
+        if (persist) ipcService.saveSettings({ lang: newLang })
             .catch((e) => console.warn('[UIStore] Failed to persist language setting:', e));
-        location.reload();
     };
+    const toggleLang = () => setLanguage(lang.value === 'cn' ? 'en' : 'cn');
 
     // Dialog Actions
     const showAlert = (msg, showBtn = true) => {
@@ -218,6 +226,7 @@ export const useUIStore = defineStore('ui', () => {
         openSettings,
         closeSettings,
         setTheme,
+        setLanguage,
         toggleLang,
         showAlert,
         showConfirm,

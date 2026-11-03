@@ -73,7 +73,8 @@ export const useProxyStore = defineStore('proxy', () => {
 
     const saveSettings = async () => {
         try {
-            const payload = JSON.parse(JSON.stringify(settings.value || {}));
+            const fields = ['preProxies', 'subscriptions', 'mode', 'notify', 'selectedId', 'enablePreProxy'];
+            const payload = JSON.parse(JSON.stringify(Object.fromEntries(fields.map(key => [key, settings.value[key]]))));
             await ipcService.saveSettings(payload);
         } catch (e) {
             console.error('[ProxyStore] Failed to save settings:', e);
@@ -176,7 +177,7 @@ export const useProxyStore = defineStore('proxy', () => {
             settings.value.subscriptions.push(subData);
             settings.value.preProxies = settings.value.preProxies.concat(res.nodes);
             await saveSettings();
-            return { success: true, count: res.count };
+            return { success: true, count: res.count, unsupportedInsecureCount: res.unsupportedInsecureCount || 0 };
         }
         return { success: false, error: res.error };
     };
@@ -188,7 +189,7 @@ export const useProxyStore = defineStore('proxy', () => {
             const res = await syncSub(subData.id);
             if (res && !res.success) return res;
             await saveSettings();
-            return { success: true };
+            return { success: true, unsupportedInsecureCount: res?.unsupportedInsecureCount || 0 };
         }
         return { success: false, error: 'Not found' };
     };

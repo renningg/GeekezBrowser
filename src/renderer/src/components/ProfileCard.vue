@@ -20,7 +20,7 @@
             </div>
             <div class="profile-meta">
                 <span v-for="tag in profile.tags" :key="tag" class="tag"
-                      :style="{ background: stringToColor(tag) + '33', color: stringToColor(tag), border: '1px solid ' + stringToColor(tag) + '44' }">
+                      :style="getTagStyle(tag)">
                     {{ tag }}
                 </span>
                 <span class="tag">{{ displayProto }}</span>
@@ -35,9 +35,22 @@
             </div>
         </div>
         <div class="actions">
-            <button class="no-drag" @click="launch" :disabled="isLaunching">{{ isLaunching ? t('launchingStatus') : t('launch') }}</button>
-            <button class="outline no-drag" @click="edit">{{ t('edit') }}</button>
-            <button class="danger no-drag" @click="remove">{{ t('delete') }}</button>
+            <button class="no-drag" @click="launch" :disabled="isLaunching">
+                <svg class="essentials-action-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg>
+                {{ isLaunching ? t('launchingStatus') : t('launch') }}
+            </button>
+            <button class="outline no-drag" @click="edit">
+                <svg class="essentials-action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M12 20h9" /><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L8 18l-4 1 1-4z" />
+                </svg>
+                {{ t('edit') }}
+            </button>
+            <button class="danger no-drag" @click="remove">
+                <svg class="essentials-action-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M3 6h18M8 6V4h8v2M19 6l-1 14H6L5 6M10 11v5M14 11v5" />
+                </svg>
+                {{ t('delete') }}
+            </button>
         </div>
     </div>
 </template>
@@ -72,12 +85,49 @@ const props = defineProps({
 
 const t = (key) => window.t ? window.t(key) : key;
 
-const stringToColor = (str) => {
-    if(!str) return '#ffffff';
+const stringToHue = (str) => {
+    if (!str) return 210;
     let hash = 0;
     for (let i = 0; i < str.length; i++) hash = str.charCodeAt(i) + ((hash << 5) - hash);
-    const c = (hash & 0x00FFFFFF).toString(16).toUpperCase();
-    return '#' + "00000".substring(0, 6 - c.length) + c;
+    return Math.abs(hash) % 360;
+};
+
+const getTagStyle = (tag) => {
+    if (uiStore.theme === 'tech-gray') {
+        return {
+            backgroundColor: 'rgba(255, 255, 255, 0.86)',
+            color: '#707070',
+            border: '1px solid rgba(24, 24, 24, 0.11)'
+        };
+    }
+    const hue = stringToHue(tag);
+    if (uiStore.theme === 'geek') {
+        return {
+            backgroundColor: `hsla(${hue}, 44%, 50%, 0.1)`,
+            color: `hsl(${hue}, 54%, 72%)`,
+            border: '1px solid rgba(72, 82, 103, 0.24)'
+        };
+    }
+    if (uiStore.theme === 'light') {
+        return {
+            backgroundColor: `hsla(${hue}, 48%, 54%, 0.09)`,
+            color: `hsl(${hue}, 42%, 43%)`,
+            border: '1px solid rgba(87, 98, 112, 0.12)'
+        };
+    }
+    const isDarkTheme = uiStore.theme === 'dark';
+    if (isDarkTheme) {
+        return {
+            backgroundColor: `hsla(${hue}, 38%, 48%, 0.09)`,
+            color: `hsl(${hue}, 48%, 72%)`,
+            border: '1px solid rgba(69, 77, 71, 0.23)'
+        };
+    }
+    return {
+        backgroundColor: `hsla(${hue}, 68%, 48%, 0.12)`,
+        color: `hsl(${hue}, 58%, 34%)`,
+        border: `1px solid hsla(${hue}, 62%, 42%, 0.2)`
+    };
 };
 
 const displayProto = computed(() => {

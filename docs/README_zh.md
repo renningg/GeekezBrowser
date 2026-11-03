@@ -4,7 +4,8 @@
 
 <img src="../src/renderer/icon.png" width="100" height="100" alt="GeekEZ Logo">
 
-[![License: CC BY-NC-SA 4.0](https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc-sa/4.0/)
+[![代码许可：PolyForm Noncommercial 1.0.0](https://img.shields.io/badge/Code%20License-PolyForm%20Noncommercial%201.0.0-blue.svg)](../LICENSE)
+[![品牌资产：CC BY-NC-SA 4.0](https://img.shields.io/badge/Brand%20Assets-CC%20BY--NC--SA%204.0-lightgrey.svg)](../ASSET-LICENSE.md)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey)
 
 **专为电商运营和多账号管理打造的指纹隐匿浏览器**
@@ -12,6 +13,16 @@
 [🇺🇸 English](../README.md) | [📥 下载安装包](https://github.com/EchoHS/GeekezBrowser/releases)
 
 </div>
+
+## ❤️ 赞助商
+
+<table>
+<tr>
+<td width="180"><a href="https://www.rapidproxy.io/?code=6NW9VJ8GK"><img src="https://browser.geekez.net/assets/rapidproxy-sponsor.png" alt="RapidProxy" width="150"></a></td>
+<td>感谢 <a href="https://www.rapidproxy.io/?code=6NW9VJ8GK">RapidProxy</a> 对本项目的赞助！RapidProxy 提供覆盖 200 多个国家和地区的 9000 万+ 住宅 IP，支持智能轮换、精准地理定位和高并发。轮换住宅代理低至 $0.55/GB 且流量不过期，静态住宅 IP 仅需 $5/IP/月。RapidProxy 支持 HTTP/HTTPS/SOCKS5 协议，适用于网页抓取、AI 数据采集、SEO 监测和电商研究。使用优惠码 <b>RAPID10</b> 可享 9 折并开始免费试用。</td>
+</tr>
+</table>
+
 
 ---
 
@@ -60,10 +71,10 @@
 
 ### 方法 1: 下载安装包 (推荐)
 前往 [**Releases**](https://github.com/EchoHS/GeekezBrowser/releases) 页面下载适配您系统的安装包：
-*   **Windows**: `GeekEZ Browser-{version}-win-x64.exe`
-*   **macOS (ARM64)**: `GeekEZ Browser-{version}-mac-arm64.dmg`
-*   **macOS (Intel)**: `GeekEZ Browser-{version}-mac-x64.dmg`
-*   **Linux**: `GeekEZ Browser-{version}-linux-x64.AppImage`
+*   **Windows**: `GeekEZ Browser-{version}-x64.exe`
+*   **macOS (ARM64)**: `GeekEZ Browser-{version}-arm64.dmg`
+*   **macOS (Intel)**: `GeekEZ Browser-{version}-x64.dmg`
+*   **Linux**: `GeekEZ Browser-{version}-x64.AppImage`
 
 ### 方法 2: 源码运行
 
@@ -136,7 +147,14 @@ npm run build:linux
 
 ## 📝 许可协议
 
-本软件遵循 [CC BY-NC-SA 4.0](https://creativecommons.org/licenses/by-nc-sa/4.0/) 许可协议。
+GeekEZ Browser 是**源码可见软件**，不属于 OSI 认可的开源软件。
+
+- **源代码：** 采用 [PolyForm Noncommercial 1.0.0](../LICENSE) 许可。个人及符合协议定义的非商业用途可以免费使用；**任何商业用途均须另行取得书面商业授权**。
+- **Logo、图标及品牌美术资产：** 其著作权按照 [CC BY-NC-SA 4.0](../ASSET-LICENSE.md) 许可，仅限符合协议的非商业使用。
+- **商标：** GeekEZ 名称和品牌标识的商标权不由 Creative Commons 协议授予，详见 [TRADEMARKS.md](../TRADEMARKS.md)。
+- **商业授权：** 申请方式及适用范围详见 [COMMERCIAL-LICENSE.md](../COMMERCIAL-LICENSE.md)。
+
+第三方组件继续适用其各自的许可证。
 
 ## 💬 交流群
 [*QQ群：1079216892*](tencent://groupwpa/?subcmd=all&uin=1079216892)
@@ -146,8 +164,8 @@ npm run build:linux
 
 <a href="https://www.star-history.com/?repos=EchoHS%2FGeekezBrowser&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/image?repos=EchoHS/GeekezBrowser&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/image?repos=EchoHS/GeekezBrowser&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/image?repos=EchoHS/GeekezBrowser&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=EchoHS/GeekezBrowser&type=date&theme=dark&legend=top-left&sealed_token=6pGlxeLVF-CkUfvKDldMx_8SwJovSNjgK59gCn2pXVZv_m7qeB93fjWSZYy188A8t-P0pwNdGkW4d8cJSq6t2DFZF5NMhbmTNICZM4QAwHpM98Q-g6JmYtoe2Z4p4TILseeW-YEaZr-2EkyPEWWWQNj-9sRCgQenQpQ8Gyn5zBvzwWNz2t81gdjsy5HX" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=EchoHS/GeekezBrowser&type=date&legend=top-left&sealed_token=6pGlxeLVF-CkUfvKDldMx_8SwJovSNjgK59gCn2pXVZv_m7qeB93fjWSZYy188A8t-P0pwNdGkW4d8cJSq6t2DFZF5NMhbmTNICZM4QAwHpM98Q-g6JmYtoe2Z4p4TILseeW-YEaZr-2EkyPEWWWQNj-9sRCgQenQpQ8Gyn5zBvzwWNz2t81gdjsy5HX" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=EchoHS/GeekezBrowser&type=date&legend=top-left&sealed_token=6pGlxeLVF-CkUfvKDldMx_8SwJovSNjgK59gCn2pXVZv_m7qeB93fjWSZYy188A8t-P0pwNdGkW4d8cJSq6t2DFZF5NMhbmTNICZM4QAwHpM98Q-g6JmYtoe2Z4p4TILseeW-YEaZr-2EkyPEWWWQNj-9sRCgQenQpQ8Gyn5zBvzwWNz2t81gdjsy5HX" />
  </picture>
 </a>

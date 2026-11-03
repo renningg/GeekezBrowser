@@ -1,6 +1,10 @@
 const os = require('os');
 const fs = require('fs');
 const path = require('path');
+const { applyStableAudioNoise } = require('./audio-noise');
+const { applyStableCanvasNoise, isStableCanvasNoiseSeed } = require('./canvas-noise');
+const { selectStableMediaDevices } = require('./media-device-profile');
+const { selectStableVoices } = require('./voice-profile');
 
 const RESOLUTIONS = [
     { w: 1920, h: 1080 },
@@ -483,6 +487,16 @@ function randInt(min, max) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
+function generateCanvasSafeNoiseSeed() {
+    // A sparse probe canvas is used by font detectors. Select a random seed
+    // whose hit count stays low enough not to split fallback font groups.
+    for (let attempt = 0; attempt < 32; attempt += 1) {
+        const candidate = randInt(1000, 9999999);
+        if (isStableCanvasNoiseSeed(candidate)) return candidate;
+    }
+    return 9535147;
+}
+
 function getRandom(arr) {
     return arr[Math.floor(Math.random() * arr.length)];
 }
@@ -610,7 +624,16 @@ function buildUserAgent(browserType, fullVersion, uaPlatformToken) {
     return base;
 }
 
+function isNoLanguageOverrideValue(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    return normalized === 'none' ||
+        normalized === 'do not modify' ||
+        normalized === 'do not modify (browser default)' ||
+        normalized === 'no change (browser default)';
+}
+
 function normalizeLanguages(language, languages) {
+    if (isNoLanguageOverrideValue(language)) return [];
     if (Array.isArray(languages) && languages.length > 0) {
         return languages.filter(Boolean).map(v => String(v));
     }
@@ -717,8 +740,12 @@ function generateFingerprint(options = {}) {
     };
 
     const screen = resolveScreen(options.screen, options.resW, options.resH);
-    const hasLanguageOverride = typeof options.language === 'string' && options.language && options.language !== 'auto';
-    const language = hasLanguageOverride ? options.language : 'auto';
+    const leaveLanguageUnmodified = isNoLanguageOverrideValue(options.language);
+    const hasLanguageOverride = typeof options.language === 'string' &&
+        options.language &&
+        options.language !== 'auto' &&
+        !leaveLanguageUnmodified;
+    const language = hasLanguageOverride ? options.language : (leaveLanguageUnmodified ? 'none' : 'auto');
     const languages = hasLanguageOverride ? normalizeLanguages(language, options.languages) : [];
 
     const webgl = resolveWebglProfile(runtimePlatform, options.webglProfile || options.webglProfileId, options.webgl);
@@ -749,7 +776,7 @@ function generateFingerprint(options = {}) {
             a: randInt(-5, 5)
         },
         audioNoise: typeof options.audioNoise === 'number' ? options.audioNoise : (Math.random() * 0.000001),
-        noiseSeed: asNumber(options.noiseSeed) || randInt(1000, 9999999),
+        noiseSeed: asNumber(options.noiseSeed) || generateCanvasSafeNoiseSeed(),
         timezone: options.timezone || 'America/Los_Angeles',
         city: options.city || null,
         geolocation: options.geolocation || null,
@@ -770,6 +797,10 @@ function generateFingerprint(options = {}) {
 function getInjectScript(fp, profileName, watermarkStyle) {
     const normalizedFp = generateFingerprint(fp || {});
     const fpJson = JSON.stringify(normalizedFp);
+    const stableAudioNoiseSource = applyStableAudioNoise.toString();
+    const stableCanvasNoiseSource = applyStableCanvasNoise.toString();
+    const stableMediaDeviceSelectorSource = selectStableMediaDevices.toString();
+    const stableVoiceSelectorSource = selectStableVoices.toString();
     const safeProfileName = (profileName || 'Profile').replace(/[<>"'&]/g, '');
     const style = watermarkStyle === 'banner' || watermarkStyle === 'off' ? watermarkStyle : 'enhanced';
 
@@ -777,36 +808,88 @@ function getInjectScript(fp, profileName, watermarkStyle) {
     (function() {
         try {
             const fp = ${fpJson};
+            const isGoogleAuthPage = (() => {
+                const isAuthHost = (host) => {
+                    const value = String(host || '').toLowerCase();
+                    return value === 'accounts.google.com' ||
+                        value.endsWith('.accounts.google.com') ||
+                        value === 'accounts.youtube.com' ||
+                        value.endsWith('.accounts.youtube.com');
+                };
+                try {
+                    const host = String(location.hostname || '').toLowerCase();
+                    const path = String(location.pathname || '').toLowerCase();
+                    if (isAuthHost(host)) return true;
+                    if ((host === 'www.google.com' || host === 'google.com') && path.startsWith('/recaptcha/')) return true;
+                } catch (e) { }
+                try {
+                    const ancestors = location.ancestorOrigins;
+                    if (ancestors && typeof ancestors.length === 'number') {
+                        for (let i = 0; i < ancestors.length; i += 1) {
+                            try {
+                                if (isAuthHost(new URL(ancestors[i]).hostname)) return true;
+                            } catch (e) { }
+                        }
+                    }
+                } catch (e) { }
+                try {
+                    if (document.referrer && isAuthHost(new URL(document.referrer).hostname)) return true;
+                } catch (e) { }
+                return false;
+            })();
+            if (isGoogleAuthPage) return;
 
-            const makeNative = (func, name) => {
-                const nativeStr = 'function ' + name + '() { [native code] }';
-                Object.defineProperty(func, 'toString', {
-                    value: function() { return nativeStr; },
-                    configurable: true,
-                    writable: true
+            const nativeFunctionStrings = new WeakMap();
+            const originalFunctionToString = Function.prototype.toString;
+            const originalToStringDescriptor = Object.getOwnPropertyDescriptor(Function.prototype, 'toString');
+            const patchedFunctionToString = new Proxy(originalFunctionToString, {
+                apply(target, thisArg, args) {
+                    if (nativeFunctionStrings.has(thisArg)) {
+                        return nativeFunctionStrings.get(thisArg);
+                    }
+                    return Reflect.apply(target, thisArg, args);
+                }
+            });
+            nativeFunctionStrings.set(
+                patchedFunctionToString,
+                Reflect.apply(originalFunctionToString, originalFunctionToString, [])
+            );
+            try {
+                Object.defineProperty(Function.prototype, 'toString', {
+                    ...originalToStringDescriptor,
+                    value: patchedFunctionToString
                 });
-                Object.defineProperty(func.toString, 'toString', {
-                    value: function() { return 'function toString() { [native code] }'; },
-                    configurable: true,
-                    writable: true
-                });
+            } catch (e) { }
+
+            const makeNative = (func, name, original) => {
+                let nativeStr = 'function ' + name + '() { [native code] }';
+                if (typeof original === 'function') {
+                    try {
+                        nativeStr = Reflect.apply(originalFunctionToString, original, []);
+                    } catch (e) { }
+                }
+                nativeFunctionStrings.set(func, nativeStr);
                 return func;
             };
 
             const defineValueGetter = (target, key, value, nativeName) => {
                 if (!target) return;
                 try {
-                    const getter = makeNative(function() { return value; }, nativeName || key);
+                    const descriptor = Object.getOwnPropertyDescriptor(target, key);
+                    const getter = makeNative(function() { return value; }, nativeName || key, descriptor && descriptor.get);
                     Object.defineProperty(target, key, {
                         get: getter,
-                        configurable: true
+                        configurable: descriptor ? descriptor.configurable : true,
+                        enumerable: descriptor ? descriptor.enumerable : true
                     });
                 } catch (e) { }
             };
 
+            const enableUaSpoof = fp.uaMode !== 'none';
+            const enableWebglSpoof = !!(fp.webgl && !fp.webgl.disabled && fp.webglProfile !== 'none');
+
             // --- 1. Basic automation markers cleanup ---
             try {
-                defineValueGetter(Navigator.prototype, 'webdriver', false, 'get webdriver');
                 const cdcRegex = /cdc_[a-zA-Z0-9]+/;
                 Object.keys(window).forEach((key) => {
                     if (cdcRegex.test(key)) {
@@ -843,12 +926,13 @@ function getInjectScript(fp, profileName, watermarkStyle) {
             if (fp.screen && fp.screen.width && fp.screen.height) {
                 const screenWidth = fp.screen.width;
                 const screenHeight = fp.screen.height;
-                defineValueGetter(screen, 'width', screenWidth, 'get width');
-                defineValueGetter(screen, 'height', screenHeight, 'get height');
-                defineValueGetter(screen, 'availWidth', screenWidth, 'get availWidth');
-                defineValueGetter(screen, 'availHeight', Math.max(0, screenHeight - 40), 'get availHeight');
-                defineValueGetter(window, 'outerWidth', screenWidth, 'get outerWidth');
-                defineValueGetter(window, 'outerHeight', screenHeight, 'get outerHeight');
+                const availWidthInset = Math.max(0, Number(screen.width || 0) - Number(screen.availWidth || 0));
+                const availHeightInset = Math.max(0, Number(screen.height || 0) - Number(screen.availHeight || 0));
+                const screenPrototype = window.Screen?.prototype || Object.getPrototypeOf(screen);
+                defineValueGetter(screenPrototype, 'width', screenWidth, 'get width');
+                defineValueGetter(screenPrototype, 'height', screenHeight, 'get height');
+                defineValueGetter(screenPrototype, 'availWidth', Math.max(0, screenWidth - availWidthInset), 'get availWidth');
+                defineValueGetter(screenPrototype, 'availHeight', Math.max(0, screenHeight - availHeightInset), 'get availHeight');
             }
 
             if (fp.hardwareConcurrency) {
@@ -860,20 +944,9 @@ function getInjectScript(fp, profileName, watermarkStyle) {
             }
 
             // --- 3. UA and User-Agent Client Hints spoof ---
-            const enableUaSpoof = fp.uaMode !== 'none';
             const targetUa = (enableUaSpoof && fp.userAgent) ? fp.userAgent : navigator.userAgent;
             const targetMeta = fp.userAgentMetadata || {};
-            const hasLanguageOverride = typeof fp.language === 'string' && fp.language && fp.language !== 'auto';
-            const targetLanguage = hasLanguageOverride ? fp.language : (navigator.language || 'en-US');
-            const targetLanguages = hasLanguageOverride
-                ? (Array.isArray(fp.languages) && fp.languages.length > 0 ? fp.languages : [targetLanguage])
-                : (Array.isArray(navigator.languages) && navigator.languages.length > 0 ? navigator.languages : [targetLanguage]);
             const targetPlatform = fp.platform || navigator.platform;
-
-            if (hasLanguageOverride) {
-                defineValueGetter(Navigator.prototype, 'language', targetLanguage, 'get language');
-                defineValueGetter(Navigator.prototype, 'languages', targetLanguages, 'get languages');
-            }
 
             if (enableUaSpoof) {
                 defineValueGetter(Navigator.prototype, 'userAgent', targetUa, 'get userAgent');
@@ -939,6 +1012,8 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                     timestamp: Date.now()
                 });
 
+                // Match Location Guard's low-risk shape: leave Geolocation.prototype
+                // native and replace only the current navigator.geolocation methods.
                 const fakeGetCurrentPosition = function getCurrentPosition(success, error, options) {
                     const position = {
                         ...buildPosition()
@@ -948,109 +1023,198 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                     }, 12);
                 };
 
-                const watchTimers = new Map();
                 const fakeWatchPosition = function watchPosition(success, error, options) {
-                    const watchId = Math.floor(Math.random() * 100000) + 1;
                     fakeGetCurrentPosition(success, error, options);
-                    if (typeof success === 'function') {
-                        watchTimers.set(watchId, setInterval(() => {
-                            try { success(buildPosition()); } catch (e) { }
-                        }, 10000));
-                    }
-                    return watchId;
-                };
-
-                const fakeClearWatch = function clearWatch(watchId) {
-                    if (watchTimers.has(watchId)) {
-                        clearInterval(watchTimers.get(watchId));
-                        watchTimers.delete(watchId);
-                    }
+                    return Math.floor(Math.random() * 10000) + 1;
                 };
 
                 try {
-                    Object.defineProperty(Geolocation.prototype, 'getCurrentPosition', {
-                        value: makeNative(fakeGetCurrentPosition, 'getCurrentPosition'),
-                        configurable: true,
-                        writable: true
-                    });
-                    Object.defineProperty(Geolocation.prototype, 'watchPosition', {
-                        value: makeNative(fakeWatchPosition, 'watchPosition'),
-                        configurable: true,
-                        writable: true
-                    });
-                    Object.defineProperty(Geolocation.prototype, 'clearWatch', {
-                        value: makeNative(fakeClearWatch, 'clearWatch'),
-                        configurable: true,
-                        writable: true
-                    });
+                    if (navigator.geolocation) {
+                        navigator.geolocation.getCurrentPosition = makeNative(fakeGetCurrentPosition, 'getCurrentPosition');
+                        navigator.geolocation.watchPosition = makeNative(fakeWatchPosition, 'watchPosition');
+                        if (typeof navigator.geolocation.clearWatch === 'function') {
+                            const originalClearWatch = navigator.geolocation.clearWatch;
+                            const fakeClearWatch = function clearWatch(watchId) {
+                                try {
+                                    return originalClearWatch.call(navigator.geolocation, watchId);
+                                } catch (e) {
+                                    return undefined;
+                                }
+                            };
+                            navigator.geolocation.clearWatch = makeNative(fakeClearWatch, 'clearWatch', originalClearWatch);
+                        }
+                    }
                 } catch (e) { }
             }
 
-            // --- 5. Intl default language alignment ---
-            if (hasLanguageOverride) {
-                const hookIntlLocaleCtor = (ctorName) => {
-                    try {
-                        const OriginalCtor = Intl[ctorName];
-                        if (typeof OriginalCtor !== 'function') return;
-                        const HookedCtor = function(locales, options) {
-                            return new OriginalCtor(locales || targetLanguage, options);
-                        };
-                        HookedCtor.prototype = OriginalCtor.prototype;
-                        if (typeof OriginalCtor.supportedLocalesOf === 'function') {
-                            HookedCtor.supportedLocalesOf = OriginalCtor.supportedLocalesOf.bind(OriginalCtor);
-                        }
-                        Intl[ctorName] = makeNative(HookedCtor, ctorName);
-                    } catch (e) { }
-                };
-
-                [
-                    'DateTimeFormat',
-                    'NumberFormat',
-                    'Collator',
-                    'DisplayNames',
-                    'ListFormat',
-                    'PluralRules',
-                    'RelativeTimeFormat',
-                    'Segmenter'
-                ].forEach(hookIntlLocaleCtor);
-            }
-
-            // --- 6. Canvas and Audio noise ---
+            // --- 5. Canvas and Audio noise ---
             try {
-                const originalGetImageData = CanvasRenderingContext2D.prototype.getImageData;
-                const hookedGetImageData = function getImageData(x, y, w, h) {
-                    const imageData = originalGetImageData.apply(this, arguments);
-                    if (fp.noiseSeed) {
-                        for (let i = 0; i < imageData.data.length; i += 4) {
-                            if ((i + fp.noiseSeed) % 53 === 0) {
-                                const noise = fp.canvasNoise ? (fp.canvasNoise.a || 0) : 0;
-                                imageData.data[i + 3] = Math.max(0, Math.min(255, imageData.data[i + 3] + noise));
-                            }
-                        }
-                    }
-                    return imageData;
+                const applyCanvasNoise = ${stableCanvasNoiseSource};
+                const originalImageDataReaders = new WeakMap();
+                const patched2DContextPrototypes = new WeakSet();
+
+                const patch2DContextPrototype = (contextPrototype) => {
+                    if (!contextPrototype || patched2DContextPrototypes.has(contextPrototype)) return;
+                    const originalGetImageData = contextPrototype.getImageData;
+                    if (typeof originalGetImageData !== 'function') return;
+                    originalImageDataReaders.set(contextPrototype, originalGetImageData);
+
+                    const hookedGetImageData = function getImageData(x, y, w, h) {
+                        const imageData = originalGetImageData.apply(this, arguments);
+                        const canvas = this && this.canvas;
+                        applyCanvasNoise(
+                            imageData.data,
+                            imageData.width,
+                            imageData.height,
+                            fp.noiseSeed,
+                            fp.canvasNoise,
+                            x,
+                            y,
+                            canvas && canvas.width ? canvas.width : imageData.width
+                        );
+                        return imageData;
+                    };
+                    contextPrototype.getImageData = makeNative(hookedGetImageData, 'getImageData', originalGetImageData);
+                    patched2DContextPrototypes.add(contextPrototype);
                 };
-                CanvasRenderingContext2D.prototype.getImageData = makeNative(hookedGetImageData, 'getImageData');
+
+                patch2DContextPrototype(window.CanvasRenderingContext2D && window.CanvasRenderingContext2D.prototype);
+                patch2DContextPrototype(window.OffscreenCanvasRenderingContext2D && window.OffscreenCanvasRenderingContext2D.prototype);
+
+                const noiseCanvasCopy = (sourceCanvas, createCanvas, getContext) => {
+                    const width = Math.max(0, Number(sourceCanvas && sourceCanvas.width) || 0);
+                    const height = Math.max(0, Number(sourceCanvas && sourceCanvas.height) || 0);
+                    if (!width || !height) return null;
+
+                    const copy = createCanvas(width, height);
+                    const context = getContext(copy);
+                    if (!context) return null;
+                    context.drawImage(sourceCanvas, 0, 0);
+
+                    const contextPrototype = Object.getPrototypeOf(context);
+                    const originalGetImageData = originalImageDataReaders.get(contextPrototype) || contextPrototype.getImageData;
+                    if (typeof originalGetImageData !== 'function') return null;
+                    const imageData = originalGetImageData.call(context, 0, 0, width, height);
+                    applyCanvasNoise(imageData.data, width, height, fp.noiseSeed, fp.canvasNoise, 0, 0, width);
+                    context.putImageData(imageData, 0, 0);
+                    return copy;
+                };
+
+                if (window.HTMLCanvasElement && window.HTMLCanvasElement.prototype) {
+                    const canvasPrototype = window.HTMLCanvasElement.prototype;
+                    const originalGetContext = canvasPrototype.getContext;
+                    const originalToDataURL = canvasPrototype.toDataURL;
+                    const originalToBlob = canvasPrototype.toBlob;
+                    const createHtmlCanvasCopy = (width, height) => {
+                        const copy = document.createElement('canvas');
+                        copy.width = width;
+                        copy.height = height;
+                        return copy;
+                    };
+                    const getHtmlCanvasContext = (canvas) => originalGetContext.call(canvas, '2d', { willReadFrequently: true });
+
+                    if (typeof originalToDataURL === 'function') {
+                        const hookedToDataURL = function toDataURL() {
+                            try {
+                                const copy = noiseCanvasCopy(this, createHtmlCanvasCopy, getHtmlCanvasContext);
+                                if (copy) return originalToDataURL.apply(copy, arguments);
+                            } catch (e) { }
+                            return originalToDataURL.apply(this, arguments);
+                        };
+                        canvasPrototype.toDataURL = makeNative(hookedToDataURL, 'toDataURL', originalToDataURL);
+                    }
+
+                    if (typeof originalToBlob === 'function') {
+                        const hookedToBlob = function toBlob() {
+                            try {
+                                const copy = noiseCanvasCopy(this, createHtmlCanvasCopy, getHtmlCanvasContext);
+                                if (copy) return originalToBlob.apply(copy, arguments);
+                            } catch (e) { }
+                            return originalToBlob.apply(this, arguments);
+                        };
+                        canvasPrototype.toBlob = makeNative(hookedToBlob, 'toBlob', originalToBlob);
+                    }
+                }
+
+                if (window.OffscreenCanvas && window.OffscreenCanvas.prototype) {
+                    const offscreenPrototype = window.OffscreenCanvas.prototype;
+                    const originalOffscreenGetContext = offscreenPrototype.getContext;
+                    const originalConvertToBlob = offscreenPrototype.convertToBlob;
+                    if (typeof originalOffscreenGetContext === 'function' && typeof originalConvertToBlob === 'function') {
+                        const hookedConvertToBlob = function convertToBlob() {
+                            try {
+                                const copy = noiseCanvasCopy(
+                                    this,
+                                    (width, height) => new OffscreenCanvas(width, height),
+                                    (canvas) => originalOffscreenGetContext.call(canvas, '2d', { willReadFrequently: true })
+                                );
+                                if (copy) return originalConvertToBlob.apply(copy, arguments);
+                            } catch (e) { }
+                            return originalConvertToBlob.apply(this, arguments);
+                        };
+                        offscreenPrototype.convertToBlob = makeNative(hookedConvertToBlob, 'convertToBlob', originalConvertToBlob);
+                    }
+                }
             } catch (e) { }
 
             try {
                 const originalGetChannelData = AudioBuffer.prototype.getChannelData;
+                const seenAudioChannels = new WeakSet();
+                const applyAudioNoise = ${stableAudioNoiseSource};
                 const hookedGetChannelData = function getChannelData(channel) {
                     const results = originalGetChannelData.apply(this, arguments);
-                    const noise = fp.audioNoise || 0.0000001;
-                    for (let i = 0; i < 100 && i < results.length; i++) {
-                        results[i] = results[i] + noise;
+                    if (!seenAudioChannels.has(results)) {
+                        seenAudioChannels.add(results);
+                        applyAudioNoise(results, fp.noiseSeed, fp.audioNoise, channel);
                     }
                     return results;
                 };
-                AudioBuffer.prototype.getChannelData = makeNative(hookedGetChannelData, 'getChannelData');
+                AudioBuffer.prototype.getChannelData = makeNative(hookedGetChannelData, 'getChannelData', originalGetChannelData);
             } catch (e) { }
 
-            // --- 7. WebGL spoof ---
-            const enableWebglSpoof = !!(fp.webgl && !fp.webgl.disabled && fp.webglProfile !== 'none');
-            if (enableWebglSpoof || enableUaSpoof) {
+            try {
+                const speechInstance = window.speechSynthesis;
+                const speechPrototype = (window.SpeechSynthesis && window.SpeechSynthesis.prototype) ||
+                    (speechInstance && Object.getPrototypeOf(speechInstance));
+                const originalGetVoices = speechPrototype && speechPrototype.getVoices;
+                if (typeof originalGetVoices === 'function') {
+                    const chooseVoices = ${stableVoiceSelectorSource};
+                    const targetVoiceLanguage = fp.language && fp.language !== 'none' && fp.language !== 'auto'
+                        ? fp.language
+                        : navigator.language;
+                    const hookedGetVoices = function getVoices() {
+                        const voices = originalGetVoices.apply(this, arguments);
+                        return chooseVoices(voices, fp.noiseSeed, targetVoiceLanguage);
+                    };
+                    speechPrototype.getVoices = makeNative(hookedGetVoices, 'getVoices', originalGetVoices);
+                }
+            } catch (e) { }
+
+            try {
+                const mediaDevices = navigator.mediaDevices;
+                const mediaDevicesPrototype = (window.MediaDevices && window.MediaDevices.prototype) ||
+                    (mediaDevices && Object.getPrototypeOf(mediaDevices));
+                const originalEnumerateDevices = mediaDevicesPrototype && mediaDevicesPrototype.enumerateDevices;
+                if (typeof originalEnumerateDevices === 'function') {
+                    const chooseMediaDevices = ${stableMediaDeviceSelectorSource};
+                    const hookedEnumerateDevices = async function enumerateDevices() {
+                        const devices = await originalEnumerateDevices.apply(this, arguments);
+                        return chooseMediaDevices(devices, fp.noiseSeed);
+                    };
+                    mediaDevicesPrototype.enumerateDevices = makeNative(
+                        hookedEnumerateDevices,
+                        'enumerateDevices',
+                        originalEnumerateDevices
+                    );
+                }
+            } catch (e) { }
+
             const webglInfo = fp.webgl || {};
-            const PATCHED_WEBGL_PROTO_KEY = '__geekezWebglPatched__';
+
+            // --- 7. WebGL spoof ---
+            if (enableWebglSpoof || enableUaSpoof) {
+            const patchedWebglPrototypes = new WeakSet();
+            const patchedContextFactories = new WeakSet();
             const debugExt = {
                 UNMASKED_VENDOR_WEBGL: 37445,
                 UNMASKED_RENDERER_WEBGL: 37446
@@ -1111,7 +1275,7 @@ function getInjectScript(fp, profileName, watermarkStyle) {
             };
 
             const hookWebGLPrototype = (proto) => {
-                if (!proto || proto[PATCHED_WEBGL_PROTO_KEY]) return;
+                if (!proto || patchedWebglPrototypes.has(proto)) return;
                 try {
                     const originalGetParameter = proto.getParameter;
                     const originalGetExtension = proto.getExtension;
@@ -1146,10 +1310,7 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                     if (originalGetSupportedExtensions) {
                         proto.getSupportedExtensions = makeNative(hookedGetSupportedExtensions, 'getSupportedExtensions');
                     }
-                    Object.defineProperty(proto, PATCHED_WEBGL_PROTO_KEY, {
-                        value: true,
-                        configurable: true
-                    });
+                    patchedWebglPrototypes.add(proto);
                 } catch (e) { }
             };
 
@@ -1162,7 +1323,7 @@ function getInjectScript(fp, profileName, watermarkStyle) {
             };
 
             const hookCanvasContextFactory = (canvasProto) => {
-                if (!canvasProto || !canvasProto.getContext) return;
+                if (!canvasProto || !canvasProto.getContext || patchedContextFactories.has(canvasProto)) return;
                 try {
                     const originalGetContext = canvasProto.getContext;
                     canvasProto.getContext = makeNative(function getContext(type) {
@@ -1172,7 +1333,8 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                             return patchContextIfNeeded(context);
                         }
                         return context;
-                    }, 'getContext');
+                    }, 'getContext', originalGetContext);
+                    patchedContextFactories.add(canvasProto);
                 } catch (e) { }
             };
 
@@ -1183,9 +1345,9 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                 hookCanvasContextFactory(window.OffscreenCanvas && window.OffscreenCanvas.prototype);
             }
 
-            // --- 7.1 WebGPU alignment ---
+            // --- 7.1 WebGPU metadata alignment ---
             // Some detectors compare WebGL renderer with WebGPU adapter info.
-            // Keep WebGPU adapter metadata aligned with selected WebGL profile.
+            // Preserve native info prototypes, capabilities and device behavior.
             const patchGpuAdapter = (gpuObj) => {
                 if (!gpuObj || typeof gpuObj.requestAdapter !== 'function') return;
                 try {
@@ -1202,7 +1364,7 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                         return vendorText || 'Unknown';
                     };
 
-                    const fakeAdapterInfo = Object.freeze({
+                    const adapterInfoOverrides = Object.freeze({
                         vendor: guessVendor(),
                         architecture: guessVendor(),
                         device: rendererText || 'Generic GPU',
@@ -1210,20 +1372,50 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                     });
 
                     const originalRequestAdapter = gpuObj.requestAdapter.bind(gpuObj);
-                    const wrapAdapter = (adapter) => {
-                        if (!adapter || typeof adapter !== 'object') return adapter;
-                        return new Proxy(adapter, {
-                            get(target, prop, receiver) {
-                                if (prop === 'requestAdapterInfo') {
-                                    return makeNative(async function requestAdapterInfo() {
-                                        return fakeAdapterInfo;
-                                    }, 'requestAdapterInfo');
+                    const adapterProxies = new WeakMap();
+                    const adapterInfoProxies = new WeakMap();
+                    const wrapAdapterInfo = (info) => {
+                        if (!info || typeof info !== 'object') return info;
+                        if (adapterInfoProxies.has(info)) return adapterInfoProxies.get(info);
+                        const proxy = new Proxy(info, {
+                            get(target, prop) {
+                                if (Object.prototype.hasOwnProperty.call(adapterInfoOverrides, prop)) {
+                                    return adapterInfoOverrides[prop];
                                 }
-                                if (prop === 'info') return fakeAdapterInfo;
-                                const value = Reflect.get(target, prop, receiver);
+                                const value = Reflect.get(target, prop, target);
                                 return typeof value === 'function' ? value.bind(target) : value;
                             }
                         });
+                        adapterInfoProxies.set(info, proxy);
+                        return proxy;
+                    };
+                    const wrapAdapter = (adapter) => {
+                        if (!adapter || typeof adapter !== 'object') return adapter;
+                        if (adapterProxies.has(adapter)) return adapterProxies.get(adapter);
+                        const boundMethods = new Map();
+                        let requestAdapterInfoWrapper = null;
+                        const proxy = new Proxy(adapter, {
+                            get(target, prop, receiver) {
+                                if (prop === 'requestAdapterInfo') {
+                                    const original = Reflect.get(target, prop, target);
+                                    if (typeof original !== 'function') return original;
+                                    if (!requestAdapterInfoWrapper) {
+                                        requestAdapterInfoWrapper = makeNative(async function requestAdapterInfo() {
+                                            const info = await original.apply(target, arguments);
+                                            return wrapAdapterInfo(info);
+                                        }, 'requestAdapterInfo', original);
+                                    }
+                                    return requestAdapterInfoWrapper;
+                                }
+                                if (prop === 'info') return wrapAdapterInfo(Reflect.get(target, prop, target));
+                                const value = Reflect.get(target, prop, target);
+                                if (typeof value !== 'function') return value;
+                                if (!boundMethods.has(prop)) boundMethods.set(prop, value.bind(target));
+                                return boundMethods.get(prop);
+                            }
+                        });
+                        adapterProxies.set(adapter, proxy);
+                        return proxy;
                     };
 
                     const hookedRequestAdapter = async function requestAdapter(options) {
@@ -1247,320 +1439,14 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                 patchGpuAdapter(navigator.gpu);
             }
 
-            // --- 7.2 Worker realm bridge ---
-            // BrowserScan/PixelScan can read GPU/UA from dedicated workers.
-            // Inject the same spoofing into worker contexts via constructor wrappers.
-            try {
-                const buildWorkerBootstrap = (sourceUrl, isModule) => {
-                    const payload = JSON.stringify({
-                        uaMode: fp.uaMode || 'spoof',
-                        enableWebglSpoof: enableWebglSpoof,
-                        userAgent: targetUa,
-                        userAgentMetadata: targetMeta,
-                        languageOverrideEnabled: hasLanguageOverride,
-                        language: targetLanguage,
-                        languages: targetLanguages,
-                        platform: targetPlatform,
-                        webgl: webglInfo
-                    });
-
-                    const workerPatch = function(workerPayload) {
-                        try {
-                            const makeNative = (func, name) => {
-                                const nativeStr = 'function ' + name + '() { [native code] }';
-                                try {
-                                    Object.defineProperty(func, 'toString', {
-                                        value: function() { return nativeStr; },
-                                        configurable: true
-                                    });
-                                } catch (e) { }
-                                return func;
-                            };
-
-                            const defineGetter = (target, key, value, nativeName) => {
-                                if (!target) return;
-                                try {
-                                    const getter = makeNative(function() { return value; }, nativeName || key);
-                                    Object.defineProperty(target, key, { get: getter, configurable: true });
-                                } catch (e) { }
-                            };
-
-                            const nav = self.navigator || {};
-                            const navProto = Object.getPrototypeOf(nav);
-                            const hasWorkerLanguageOverride = !!workerPayload.languageOverrideEnabled;
-                            const targetLang = hasWorkerLanguageOverride
-                                ? (workerPayload.language || 'en-US')
-                                : (nav.language || 'en-US');
-                            const targetLangs = hasWorkerLanguageOverride
-                                ? (Array.isArray(workerPayload.languages) && workerPayload.languages.length > 0
-                                    ? workerPayload.languages
-                                    : [targetLang])
-                                : (Array.isArray(nav.languages) && nav.languages.length > 0 ? nav.languages : [targetLang]);
-                            const targetPlatform = workerPayload.platform || '';
-
-                            const enableWorkerUaSpoof = workerPayload.uaMode !== 'none';
-                            if (enableWorkerUaSpoof) {
-                                defineGetter(navProto, 'userAgent', workerPayload.userAgent || nav.userAgent, 'get userAgent');
-                                defineGetter(navProto, 'appVersion', String(workerPayload.userAgent || nav.userAgent || '').replace(/^Mozilla\\//, ''), 'get appVersion');
-                                defineGetter(navProto, 'platform', targetPlatform || nav.platform, 'get platform');
-                            }
-                            if (hasWorkerLanguageOverride) {
-                                defineGetter(navProto, 'language', targetLang, 'get language');
-                                defineGetter(navProto, 'languages', targetLangs, 'get languages');
-                            }
-
-                            if (enableWorkerUaSpoof) {
-                                const targetMeta = workerPayload.userAgentMetadata || {};
-                                const uaDataSnapshot = {
-                                    brands: Array.isArray(targetMeta.brands) ? targetMeta.brands : [],
-                                    mobile: !!targetMeta.mobile,
-                                    platform: targetMeta.platform || (String(targetPlatform).includes('Mac') ? 'macOS' : (String(targetPlatform).includes('Win') ? 'Windows' : 'Linux'))
-                                };
-                                const highEntropyValues = {
-                                    architecture: targetMeta.architecture || 'x86',
-                                    bitness: targetMeta.bitness || '64',
-                                    model: targetMeta.model || '',
-                                    platformVersion: targetMeta.platformVersion || '10.0.0',
-                                    uaFullVersion: targetMeta.uaFullVersion || '',
-                                    wow64: !!targetMeta.wow64,
-                                    fullVersionList: Array.isArray(targetMeta.fullVersionList) ? targetMeta.fullVersionList : []
-                                };
-                                const uaData = {
-                                    brands: uaDataSnapshot.brands,
-                                    mobile: uaDataSnapshot.mobile,
-                                    platform: uaDataSnapshot.platform,
-                                    getHighEntropyValues: makeNative(async function getHighEntropyValues(hints) {
-                                        const out = { ...uaDataSnapshot };
-                                        if (Array.isArray(hints)) {
-                                            hints.forEach((hint) => {
-                                                if (Object.prototype.hasOwnProperty.call(highEntropyValues, hint)) {
-                                                    out[hint] = highEntropyValues[hint];
-                                                }
-                                            });
-                                        }
-                                        return out;
-                                    }, 'getHighEntropyValues'),
-                                    toJSON: makeNative(function toJSON() {
-                                        return { ...uaDataSnapshot };
-                                    }, 'toJSON')
-                                };
-                                defineGetter(navProto, 'userAgentData', uaData, 'get userAgentData');
-                            }
-
-                            if (hasWorkerLanguageOverride) {
-                                ['DateTimeFormat', 'NumberFormat', 'Collator', 'DisplayNames', 'ListFormat', 'PluralRules', 'RelativeTimeFormat', 'Segmenter']
-                                    .forEach((ctorName) => {
-                                        try {
-                                            const OriginalCtor = Intl[ctorName];
-                                            if (typeof OriginalCtor !== 'function') return;
-                                            const HookedCtor = function(locales, options) {
-                                                return new OriginalCtor(locales || targetLang, options);
-                                            };
-                                            HookedCtor.prototype = OriginalCtor.prototype;
-                                            if (typeof OriginalCtor.supportedLocalesOf === 'function') {
-                                                HookedCtor.supportedLocalesOf = OriginalCtor.supportedLocalesOf.bind(OriginalCtor);
-                                            }
-                                            Intl[ctorName] = makeNative(HookedCtor, ctorName);
-                                        } catch (e) { }
-                                    });
-                            }
-
-                            const enableWorkerWebglSpoof = !!workerPayload.enableWebglSpoof;
-                            if (enableWorkerWebglSpoof) {
-                                const workerWebgl = workerPayload.webgl || {};
-                                const patchKey = '__geekezWebglPatched__';
-                                const debugExt = { UNMASKED_VENDOR_WEBGL: 37445, UNMASKED_RENDERER_WEBGL: 37446 };
-                                const deriveWorkerCaps = () => {
-                                    const renderer = String(workerWebgl.unmaskedRenderer || workerWebgl.renderer || '').toLowerCase();
-                                    const vendor = String(workerWebgl.unmaskedVendor || workerWebgl.vendor || '').toLowerCase();
-                                    const isApple = renderer.includes('apple') || vendor.includes('apple');
-                                    const isNvidia = renderer.includes('nvidia') || vendor.includes('nvidia');
-                                    const isAmd = renderer.includes('amd') || renderer.includes('radeon') || vendor.includes('ati');
-                                    const isIntel = renderer.includes('intel') || vendor.includes('intel');
-
-                                    let textureSize = 16384;
-                                    let renderbufferSize = 16384;
-                                    let vertexUniforms = 1024;
-                                    let fragmentUniforms = 1024;
-                                    let varyingVectors = 30;
-
-                                    if (isApple || isNvidia || isAmd) {
-                                        textureSize = 32768;
-                                        renderbufferSize = 32768;
-                                        vertexUniforms = 4096;
-                                        fragmentUniforms = 2048;
-                                        varyingVectors = 32;
-                                    } else if (isIntel) {
-                                        textureSize = 16384;
-                                        renderbufferSize = 16384;
-                                        vertexUniforms = 2048;
-                                        fragmentUniforms = 1024;
-                                        varyingVectors = 30;
-                                    }
-
-                                    return {
-                                        3379: textureSize,
-                                        34076: textureSize,
-                                        34024: renderbufferSize,
-                                        34921: 16,
-                                        34930: 16,
-                                        35660: 16,
-                                        35661: 32,
-                                        36347: vertexUniforms,
-                                        36348: varyingVectors,
-                                        36349: fragmentUniforms,
-                                        3386: new Int32Array([textureSize, textureSize]),
-                                        33901: new Float32Array([1, 1024]),
-                                        33902: new Float32Array([1, 1]),
-                                        34852: 8,
-                                        36063: 8
-                                    };
-                                };
-                                const workerCaps = deriveWorkerCaps();
-                                const cloneWorkerCap = (value) => {
-                                    if (value instanceof Int32Array) return new Int32Array(value);
-                                    if (value instanceof Float32Array) return new Float32Array(value);
-                                    if (Array.isArray(value)) return value.slice();
-                                    return value;
-                                };
-                                const hookProto = (proto) => {
-                                    if (!proto || proto[patchKey]) return;
-                                    try {
-                                        const origGetParameter = proto.getParameter;
-                                        const origGetExtension = proto.getExtension;
-                                        const origGetSupportedExtensions = proto.getSupportedExtensions;
-                                        proto.getParameter = makeNative(function getParameter(param) {
-                                            if (param === 37445) return workerWebgl.unmaskedVendor || workerWebgl.vendor || 'Google Inc.';
-                                            if (param === 37446) return workerWebgl.unmaskedRenderer || workerWebgl.renderer || 'ANGLE (Unknown GPU)';
-                                            if (param === 7936) return workerWebgl.vendor || 'Google Inc.';
-                                            if (param === 7937) return workerWebgl.renderer || 'ANGLE (Unknown GPU)';
-                                            if (param === 7938) return workerWebgl.version || 'WebGL 1.0 (OpenGL ES 2.0 Chromium)';
-                                            if (param === 35724) return workerWebgl.shadingLanguageVersion || 'WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)';
-                                            if (Object.prototype.hasOwnProperty.call(workerCaps, param)) return cloneWorkerCap(workerCaps[param]);
-                                            return origGetParameter.apply(this, arguments);
-                                        }, 'getParameter');
-                                        proto.getExtension = makeNative(function getExtension(name) {
-                                            if (name === 'WEBGL_debug_renderer_info') return debugExt;
-                                            return origGetExtension.apply(this, arguments);
-                                        }, 'getExtension');
-                                        if (origGetSupportedExtensions) {
-                                            proto.getSupportedExtensions = makeNative(function getSupportedExtensions() {
-                                                const list = origGetSupportedExtensions.apply(this, arguments) || [];
-                                                if (Array.isArray(list) && !list.includes('WEBGL_debug_renderer_info')) {
-                                                    return list.concat(['WEBGL_debug_renderer_info']);
-                                                }
-                                                return list;
-                                            }, 'getSupportedExtensions');
-                                        }
-                                        Object.defineProperty(proto, patchKey, { value: true, configurable: true });
-                                    } catch (e) { }
-                                };
-
-                                hookProto(self.WebGLRenderingContext && self.WebGLRenderingContext.prototype);
-                                hookProto(self.WebGL2RenderingContext && self.WebGL2RenderingContext.prototype);
-
-                                if (self.OffscreenCanvas && self.OffscreenCanvas.prototype && self.OffscreenCanvas.prototype.getContext) {
-                                    try {
-                                        const origGetContext = self.OffscreenCanvas.prototype.getContext;
-                                        self.OffscreenCanvas.prototype.getContext = makeNative(function getContext(type) {
-                                            const ctx = origGetContext.apply(this, arguments);
-                                            const name = String(type || '').toLowerCase();
-                                            if (name === 'webgl' || name === 'experimental-webgl' || name === 'webgl2') {
-                                                try { hookProto(Object.getPrototypeOf(ctx)); } catch (e) { }
-                                            }
-                                            return ctx;
-                                        }, 'getContext');
-                                    } catch (e) { }
-                                }
-
-                                if (nav.gpu && typeof nav.gpu.requestAdapter === 'function') {
-                                    try {
-                                        const rendererText = String(workerWebgl.unmaskedRenderer || workerWebgl.renderer || '');
-                                        const vendorText = String(workerWebgl.unmaskedVendor || workerWebgl.vendor || '');
-                                        const fakeAdapterInfo = Object.freeze({
-                                            vendor: vendorText || 'Unknown',
-                                            architecture: vendorText || 'Unknown',
-                                            device: rendererText || 'Generic GPU',
-                                            description: rendererText || 'Generic GPU Adapter'
-                                        });
-                                        const origRequestAdapter = nav.gpu.requestAdapter.bind(nav.gpu);
-                                        const wrapped = async function requestAdapter(options) {
-                                            const adapter = await origRequestAdapter(options);
-                                            if (!adapter || typeof adapter !== 'object') return adapter;
-                                            return new Proxy(adapter, {
-                                                get(target, prop, receiver) {
-                                                    if (prop === 'requestAdapterInfo') {
-                                                        return makeNative(async function requestAdapterInfo() {
-                                                            return fakeAdapterInfo;
-                                                        }, 'requestAdapterInfo');
-                                                    }
-                                                    if (prop === 'info') return fakeAdapterInfo;
-                                                    const value = Reflect.get(target, prop, receiver);
-                                                    return typeof value === 'function' ? value.bind(target) : value;
-                                                }
-                                            });
-                                        };
-                                        Object.defineProperty(Object.getPrototypeOf(nav.gpu), 'requestAdapter', {
-                                            value: makeNative(wrapped, 'requestAdapter'),
-                                            configurable: true,
-                                            writable: true
-                                        });
-                                    } catch (e) { }
-                                }
-                            }
-                        } catch (e) { }
-                    };
-
-                    const bootstrap = '(' + workerPatch.toString() + ')(' + payload + ');';
-                    if (isModule) {
-                        return bootstrap + '\\nimport(' + JSON.stringify(sourceUrl) + ');';
-                    }
-                    return bootstrap + '\\nimportScripts(' + JSON.stringify(sourceUrl) + ');';
-                };
-
-                const wrapWorkerConstructor = (ctorName) => {
-                    const OriginalCtor = window[ctorName];
-                    if (typeof OriginalCtor !== 'function') return;
-
-                    const HookedCtor = function(scriptURL, optionsOrName) {
-                        try {
-                            const originalUrl = new URL(String(scriptURL), location.href).href;
-                            const isModule = !!(optionsOrName && typeof optionsOrName === 'object' && optionsOrName.type === 'module');
-                            const bootstrapCode = buildWorkerBootstrap(originalUrl, isModule);
-                            const blob = new Blob([bootstrapCode], { type: 'application/javascript' });
-                            const blobUrl = URL.createObjectURL(blob);
-                            const worker = new OriginalCtor(blobUrl, optionsOrName);
-                            setTimeout(() => {
-                                try { URL.revokeObjectURL(blobUrl); } catch (e) { }
-                            }, 15000);
-                            return worker;
-                        } catch (e) {
-                            return new OriginalCtor(scriptURL, optionsOrName);
-                        }
-                    };
-
-                    HookedCtor.prototype = OriginalCtor.prototype;
-                    try {
-                        Object.defineProperty(window, ctorName, {
-                            value: makeNative(HookedCtor, ctorName),
-                            configurable: true,
-                            writable: true
-                        });
-                    } catch (e) {
-                        window[ctorName] = makeNative(HookedCtor, ctorName);
-                    }
-                };
-
-                wrapWorkerConstructor('Worker');
-                wrapWorkerConstructor('SharedWorker');
-            } catch (e) { }
             }
+
 
             // --- 8. WebRTC protection ---
             if (window.RTCPeerConnection) {
                 const OriginalRTCPeerConnection = window.RTCPeerConnection;
                 const HookedRTCPeerConnection = function RTCPeerConnection(config) {
-                    const nextConfig = config || {};
+                    const nextConfig = config ? { ...config } : {};
                     nextConfig.iceTransportPolicy = 'relay';
                     return new OriginalRTCPeerConnection(nextConfig);
                 };
@@ -1569,11 +1455,13 @@ function getInjectScript(fp, profileName, watermarkStyle) {
             }
 
             // --- 9. Watermark ---
+            if (window.self !== window.top) return;
             const watermarkStyle = '${style}';
 
             function createWatermark() {
                 try {
                     if (watermarkStyle === 'off') return;
+                    if (window.__geekezWatermarkDismissedForDocument__) return;
                     if (document.getElementById('geekez-watermark')) return;
                     if (!document.body) {
                         setTimeout(createWatermark, 50);
@@ -1583,7 +1471,7 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                     if (watermarkStyle === 'banner') {
                         const banner = document.createElement('div');
                         banner.id = 'geekez-watermark';
-                        banner.style.cssText = 'position: fixed; top: 0; left: 0; right: 0; background: linear-gradient(135deg, rgba(102, 126, 234, 0.5), rgba(118, 75, 162, 0.5)); backdrop-filter: blur(10px); color: white; padding: 5px 20px; text-align: center; font-size: 12px; font-weight: 500; z-index: 2147483647; box-shadow: 0 2px 10px rgba(0,0,0,0.1); display: flex; align-items: center; justify-content: center; gap: 8px; font-family: monospace;';
+                        banner.style.cssText = 'position: fixed; bottom: 0; left: 0; right: 0; background: linear-gradient(135deg, rgba(102, 126, 234, 0.5), rgba(118, 75, 162, 0.5)); backdrop-filter: blur(10px); color: white; padding: 5px 20px; text-align: center; font-size: 12px; font-weight: 500; z-index: 2147483647; box-shadow: 0 -2px 10px rgba(0,0,0,0.1); display: flex; align-items: center; justify-content: center; gap: 8px; font-family: monospace;';
 
                         const icon = document.createElement('span');
                         icon.textContent = '🔹';
@@ -1594,7 +1482,10 @@ function getInjectScript(fp, profileName, watermarkStyle) {
                         const closeBtn = document.createElement('button');
                         closeBtn.textContent = '×';
                         closeBtn.style.cssText = 'position: absolute; right: 10px; background: rgba(255,255,255,0.2); border: none; color: white; width: 20px; height: 20px; border-radius: 50%; cursor: pointer; font-size: 16px; line-height: 1;';
-                        closeBtn.onclick = function() { banner.style.display = 'none'; };
+                        closeBtn.onclick = function() {
+                            window.__geekezWatermarkDismissedForDocument__ = true;
+                            if (banner.parentNode) banner.parentNode.removeChild(banner);
+                        };
 
                         banner.appendChild(icon);
                         banner.appendChild(text);
@@ -1638,102 +1529,6 @@ function getInjectScript(fp, profileName, watermarkStyle) {
     `;
 }
 
-function getGeolocationScript(fp) {
-    const normalizedFp = generateFingerprint(fp || {});
-    const geo = normalizedFp.geolocation;
-    if (!geo || typeof geo.latitude !== 'number' || typeof geo.longitude !== 'number') {
-        return '(() => {})();';
-    }
-
-    const geoJson = JSON.stringify({
-        latitude: geo.latitude,
-        longitude: geo.longitude,
-        accuracy: geo.accuracy || 100
-    });
-
-    return `
-    (function() {
-        try {
-            const geo = ${geoJson};
-            if (!window.Geolocation || !Geolocation.prototype) return;
-
-            const makeNative = (func, name) => {
-                const nativeStr = 'function ' + name + '() { [native code] }';
-                Object.defineProperty(func, 'toString', {
-                    value: function() { return nativeStr; },
-                    configurable: true,
-                    writable: true
-                });
-                Object.defineProperty(func.toString, 'toString', {
-                    value: function() { return 'function toString() { [native code] }'; },
-                    configurable: true,
-                    writable: true
-                });
-                return func;
-            };
-
-            const latitude = geo.latitude;
-            const longitude = geo.longitude;
-            const accuracy = geo.accuracy || 100;
-            const watchTimers = new Map();
-
-            const buildPosition = () => ({
-                coords: {
-                    latitude: latitude + (Math.random() - 0.5) * 0.005,
-                    longitude: longitude + (Math.random() - 0.5) * 0.005,
-                    accuracy,
-                    altitude: null,
-                    altitudeAccuracy: null,
-                    heading: null,
-                    speed: null
-                },
-                timestamp: Date.now()
-            });
-
-            const fakeGetCurrentPosition = function getCurrentPosition(success, error, options) {
-                setTimeout(() => {
-                    if (typeof success === 'function') success(buildPosition());
-                }, 12);
-            };
-
-            const fakeWatchPosition = function watchPosition(success, error, options) {
-                const watchId = Math.floor(Math.random() * 100000) + 1;
-                fakeGetCurrentPosition(success, error, options);
-                if (typeof success === 'function') {
-                    watchTimers.set(watchId, setInterval(() => {
-                        try { success(buildPosition()); } catch (e) { }
-                    }, 10000));
-                }
-                return watchId;
-            };
-
-            const fakeClearWatch = function clearWatch(watchId) {
-                if (watchTimers.has(watchId)) {
-                    clearInterval(watchTimers.get(watchId));
-                    watchTimers.delete(watchId);
-                }
-            };
-
-            Object.defineProperty(Geolocation.prototype, 'getCurrentPosition', {
-                value: makeNative(fakeGetCurrentPosition, 'getCurrentPosition'),
-                configurable: true,
-                writable: true
-            });
-            Object.defineProperty(Geolocation.prototype, 'watchPosition', {
-                value: makeNative(fakeWatchPosition, 'watchPosition'),
-                configurable: true,
-                writable: true
-            });
-            Object.defineProperty(Geolocation.prototype, 'clearWatch', {
-                value: makeNative(fakeClearWatch, 'clearWatch'),
-                configurable: true,
-                writable: true
-            });
-        } catch (e) { }
-    })();
-    `;
-}
-
 function getWatermarkScript(profileName, watermarkStyle) {
     const safeProfileName = (profileName || 'Profile').replace(/[<>"'&]/g, '');
     const style = watermarkStyle === 'banner' || watermarkStyle === 'off' ? watermarkStyle : 'enhanced';
@@ -1742,6 +1537,7 @@ function getWatermarkScript(profileName, watermarkStyle) {
         return `
         (function() {
             try {
+                if (window.self !== window.top) return;
                 const watermark = document.getElementById('geekez-watermark');
                 if (watermark && watermark.parentNode) {
                     watermark.parentNode.removeChild(watermark);
@@ -1754,6 +1550,37 @@ function getWatermarkScript(profileName, watermarkStyle) {
     return `
     (function() {
         try {
+            if (window.self !== window.top) return;
+            const isGoogleAuthPage = (() => {
+                const isAuthHost = (host) => {
+                    const value = String(host || '').toLowerCase();
+                    return value === 'accounts.google.com' ||
+                        value.endsWith('.accounts.google.com') ||
+                        value === 'accounts.youtube.com' ||
+                        value.endsWith('.accounts.youtube.com');
+                };
+                try {
+                    const host = String(location.hostname || '').toLowerCase();
+                    const path = String(location.pathname || '').toLowerCase();
+                    if (isAuthHost(host)) return true;
+                    if ((host === 'www.google.com' || host === 'google.com') && path.startsWith('/recaptcha/')) return true;
+                } catch (e) { }
+                try {
+                    const ancestors = location.ancestorOrigins;
+                    if (ancestors && typeof ancestors.length === 'number') {
+                        for (let i = 0; i < ancestors.length; i += 1) {
+                            try {
+                                if (isAuthHost(new URL(ancestors[i]).hostname)) return true;
+                            } catch (e) { }
+                        }
+                    }
+                } catch (e) { }
+                try {
+                    if (document.referrer && isAuthHost(new URL(document.referrer).hostname)) return true;
+                } catch (e) { }
+                return false;
+            })();
+            if (isGoogleAuthPage) return;
             if (window.__geekezWatermarkBootstrapped__) return;
             window.__geekezWatermarkBootstrapped__ = true;
 
@@ -1772,6 +1599,7 @@ function getWatermarkScript(profileName, watermarkStyle) {
 
             function createWatermark() {
                 try {
+                    if (window.__geekezWatermarkDismissedForDocument__) return;
                     if (document.getElementById('geekez-watermark')) return;
                     if (!document.body) {
                         setTimeout(createWatermark, 50);
@@ -1783,7 +1611,7 @@ function getWatermarkScript(profileName, watermarkStyle) {
                     if (watermarkStyle === 'banner') {
                         const banner = document.createElement('div');
                         banner.id = 'geekez-watermark';
-                        banner.style.cssText = 'position: fixed; top: 0; left: 0; right: 0; background: linear-gradient(135deg, rgba(102, 126, 234, 0.5), rgba(118, 75, 162, 0.5)); backdrop-filter: blur(10px); color: white; padding: 5px 20px; text-align: center; font-size: 12px; font-weight: 500; z-index: 2147483647; box-shadow: 0 2px 10px rgba(0,0,0,0.1); display: flex; align-items: center; justify-content: center; gap: 8px; font-family: monospace;';
+                        banner.style.cssText = 'position: fixed; bottom: 0; left: 0; right: 0; background: linear-gradient(135deg, rgba(102, 126, 234, 0.5), rgba(118, 75, 162, 0.5)); backdrop-filter: blur(10px); color: white; padding: 5px 20px; text-align: center; font-size: 12px; font-weight: 500; z-index: 2147483647; box-shadow: 0 -2px 10px rgba(0,0,0,0.1); display: flex; align-items: center; justify-content: center; gap: 8px; font-family: monospace;';
 
                         const icon = document.createElement('span');
                         icon.textContent = '🔹';
@@ -1794,7 +1622,10 @@ function getWatermarkScript(profileName, watermarkStyle) {
                         const closeBtn = document.createElement('button');
                         closeBtn.textContent = '×';
                         closeBtn.style.cssText = 'position: absolute; right: 10px; background: rgba(255,255,255,0.2); border: none; color: white; width: 20px; height: 20px; border-radius: 50%; cursor: pointer; font-size: 16px; line-height: 1;';
-                        closeBtn.onclick = function() { banner.style.display = 'none'; };
+                        closeBtn.onclick = function() {
+                            window.__geekezWatermarkDismissedForDocument__ = true;
+                            if (banner.parentNode) banner.parentNode.removeChild(banner);
+                        };
 
                         banner.appendChild(icon);
                         banner.appendChild(text);
@@ -1845,4 +1676,4 @@ function getWatermarkScript(profileName, watermarkStyle) {
     `;
 }
 
-export { generateFingerprint, getInjectScript, getGeolocationScript, getWatermarkScript };
+export { generateFingerprint, getInjectScript, getWatermarkScript };

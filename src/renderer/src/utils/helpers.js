@@ -36,6 +36,71 @@ export function getProxyRemark(link) {
     return '';
 }
 
+function isUnsupportedXrayInsecureValue(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    return normalized === '1' || normalized === 'true';
+}
+
+function readProxySearchParams(link) {
+    const value = String(link || '').trim();
+    if (!value || !value.includes('?')) return null;
+
+    try {
+        return new URL(value).searchParams;
+    } catch (e) {
+        const queryStart = value.indexOf('?');
+        if (queryStart === -1) return null;
+        const hashStart = value.indexOf('#', queryStart);
+        const query = hashStart === -1
+            ? value.slice(queryStart + 1)
+            : value.slice(queryStart + 1, hashStart);
+        return new URLSearchParams(query);
+    }
+}
+
+function hasHysteria2CertificatePin(link, params) {
+    const scheme = String(link || '').trim().split(':', 1)[0].toLowerCase();
+    if (scheme !== 'hy2' && scheme !== 'hysteria2') return false;
+    return Boolean(params.get('pinSHA256') || params.get('pin-sha256') || params.get('pin'));
+}
+
+export function hasUnsupportedXrayInsecureParam(link) {
+    const params = readProxySearchParams(link);
+    if (!params) return false;
+    if (hasHysteria2CertificatePin(link, params)) return false;
+
+    for (const [key, value] of params.entries()) {
+        const normalizedKey = String(key || '').trim().toLowerCase();
+        if (
+            (normalizedKey === 'insecure' || normalizedKey === 'allowinsecure') &&
+            isUnsupportedXrayInsecureValue(value)
+        ) {
+            return true;
+        }
+    }
+    return false;
+}
+
+export function countUnsupportedXrayInsecureLinks(input) {
+    const lines = Array.isArray(input)
+        ? input.map(item => String(item || '').trim()).filter(Boolean)
+        : String(input || '').split(/[\r\n]+/).map(item => item.trim()).filter(Boolean);
+    return lines.filter(hasUnsupportedXrayInsecureParam).length;
+}
+
+export function formatUnsupportedXrayInsecureWarning(count) {
+    if (count <= 0) return '';
+
+    const template = window.t
+        ? window.t('unsupportedXrayInsecureWarn')
+        : 'Xray-core no longer supports insecure/allowInsecure=1. The original link was kept, but this parameter will be ignored at runtime. Affected nodes: {count}.';
+    return String(template).replace('{count}', String(count));
+}
+
+export function getUnsupportedXrayInsecureWarning(input) {
+    return formatUnsupportedXrayInsecureWarning(countUnsupportedXrayInsecureLinks(input));
+}
+
 /**
  * 简单的文本转颜色生成器
  */

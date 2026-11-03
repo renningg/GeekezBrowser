@@ -16,6 +16,14 @@
                     @click="settingsStore.setTab('advanced')" data-i18n="settingsTabAdvanced">
                     {{ $t('settingsTabAdvanced') }}
                 </div>
+                <div class="tab-btn" :class="{ active: settingsStore.activeTab === 'default-bookmarks' }"
+                    @click="settingsStore.setTab('default-bookmarks')" data-i18n="settingsTabDefaultBookmarks">
+                    {{ $t('settingsTabDefaultBookmarks') }}
+                </div>
+                <div class="tab-btn" :class="{ active: settingsStore.activeTab === 'default-passwords' }"
+                    @click="settingsStore.setTab('default-passwords')" data-i18n="settingsTabDefaultPasswords">
+                    {{ $t('settingsTabDefaultPasswords') }}
+                </div>
             </div>
 
             <div id="settingsContent" style="flex:1; overflow-y:auto; padding:10px;">
@@ -132,262 +140,138 @@
                     </div>
                 </div>
 
-                <!-- Advanced Tab -->
-                <div v-if="settingsStore.activeTab === 'advanced'" class="settings-section">
-                    <h3 style="margin-bottom:15px; color:var(--accent);" data-i18n="settingsAdvTitle">{{ $t('settingsAdvTitle') }}</h3>
+                <!-- Default Bookmarks Tab -->
+                <div v-if="settingsStore.activeTab === 'default-bookmarks'" class="settings-section">
+                    <h3 style="margin-bottom:10px; color:var(--accent);">{{ $t('defaultBookmarkTitle') }}</h3>
+                    <p class="default-bookmark-desc">{{ $t('defaultBookmarkDesc') }}</p>
 
-                    <!-- Developer Features - Unified Tech Style -->
-                    <div style="margin-bottom: 25px;">
-                        <div style="display:flex; align-items:center; gap:10px; margin-bottom:16px;">
-                            <div style="width:4px; height:20px; background:linear-gradient(180deg, var(--accent), #7c3aed); border-radius:2px;"></div>
-                            <h4 style="margin:0; color:var(--text-primary); font-size:15px; font-weight:600; letter-spacing:0.5px;"
-                                data-i18n="devFeaturesTitle">
-                                {{ $t('devFeaturesTitle') }}
-                            </h4>
+                    <div class="default-bookmark-list">
+                        <div v-if="settingsStore.defaultBookmarks.length === 0" class="default-bookmark-empty">
+                            {{ $t('defaultBookmarkEmpty') }}
                         </div>
-
-                        <div style="border:1px solid var(--border); border-radius:12px; padding:4px; background:var(--card-bg);">
-                            <!-- UA/WebGL Customize Toggle -->
-                            <label class="dev-toggle-item" style="display:flex; align-items:center; gap:14px; padding:14px 16px; cursor:pointer; border-radius:8px; transition:all 0.2s;">
-                                <div class="toggle-switch" style="position:relative; width:44px; height:24px; flex-shrink:0;">
-                                    <input type="checkbox" :checked="settingsStore.enableUaWebglModify"
-                                        style="opacity:0; width:0; height:0; position:absolute;"
-                                        @change="e => settingsStore.toggleUaWebglModify(e.target.checked)">
-                                    <div class="toggle-track" :style="{ background: settingsStore.enableUaWebglModify ? 'var(--accent)' : 'var(--border)' }"
-                                        style="position:absolute; inset:0; border-radius:12px; transition:0.3s;">
-                                    </div>
-                                    <div class="toggle-knob" :style="{ left: settingsStore.enableUaWebglModify ? '22px' : '2px' }"
-                                        style="position:absolute; top:2px; width:20px; height:20px; background:#fff; border-radius:50%; transition:0.3s; box-shadow:0 2px 4px rgba(0,0,0,0.2);">
-                                    </div>
-                                </div>
-                                <div style="flex:1;">
-                                    <div style="font-size:13px; font-weight:500; color:var(--text-primary);"
-                                        data-i18n="uaWebglToggle">{{ $t('uaWebglToggle') }}</div>
-                                    <div style="font-size:11px; color:var(--text-secondary); opacity:0.8;"
-                                        data-i18n="uaWebglToggleHint">{{ $t('uaWebglToggleHint') }}</div>
-                                    <div style="font-size:11px; color:#ffb3b3; margin-top:4px;"
-                                        data-i18n="uaWebglToggleWarn">{{ $t('uaWebglToggleWarn') }}</div>
-                                </div>
-                            </label>
-
-                            <div style="height:1px; background:var(--border); margin:0 16px;"></div>
-
-                            <!-- Remote Debugging Toggle -->
-                            <label class="dev-toggle-item" style="display:flex; align-items:center; gap:14px; padding:14px 16px; cursor:pointer; border-radius:8px; transition:all 0.2s;">
-                                <div class="toggle-switch" style="position:relative; width:44px; height:24px; flex-shrink:0;">
-                                    <input type="checkbox" :checked="settingsStore.enableRemoteDebugging"
-                                        style="opacity:0; width:0; height:0; position:absolute;"
-                                        @change="e => settingsStore.toggleRemoteDebugging(e.target.checked)">
-                                    <div class="toggle-track" :style="{ background: settingsStore.enableRemoteDebugging ? 'var(--accent)' : 'var(--border)' }"
-                                        style="position:absolute; inset:0; border-radius:12px; transition:0.3s;">
-                                    </div>
-                                    <div class="toggle-knob" :style="{ left: settingsStore.enableRemoteDebugging ? '22px' : '2px' }"
-                                        style="position:absolute; top:2px; width:20px; height:20px; background:#fff; border-radius:50%; transition:0.3s; box-shadow:0 2px 4px rgba(0,0,0,0.2);">
-                                    </div>
-                                </div>
-                                <div style="flex:1;">
-                                    <div style="font-size:13px; font-weight:500; color:var(--text-primary);"
-                                        data-i18n="debugToggle">{{ $t('debugToggle') }}</div>
-                                    <div style="font-size:11px; color:var(--text-secondary); opacity:0.8;"
-                                        data-i18n="debugToggleHint">{{ $t('debugToggleHint') }}</div>
-                                </div>
-                            </label>
-
-                            <div style="height:1px; background:var(--border); margin:0 16px;"></div>
-
-                            <!-- Custom Args Toggle -->
-                            <label class="dev-toggle-item" style="display:flex; align-items:center; gap:14px; padding:14px 16px; cursor:pointer; border-radius:8px; transition:all 0.2s;">
-                                <div class="toggle-switch" style="position:relative; width:44px; height:24px; flex-shrink:0;">
-                                    <input type="checkbox" :checked="settingsStore.enableCustomArgs"
-                                        style="opacity:0; width:0; height:0; position:absolute;"
-                                        @change="e => settingsStore.toggleCustomArgs(e.target.checked)">
-                                    <div class="toggle-track" :style="{ background: settingsStore.enableCustomArgs ? 'var(--accent)' : 'var(--border)' }"
-                                        style="position:absolute; inset:0; border-radius:12px; transition:0.3s;">
-                                    </div>
-                                    <div class="toggle-knob" :style="{ left: settingsStore.enableCustomArgs ? '22px' : '2px' }"
-                                        style="position:absolute; top:2px; width:20px; height:20px; background:#fff; border-radius:50%; transition:0.3s; box-shadow:0 2px 4px rgba(0,0,0,0.2);">
-                                    </div>
-                                </div>
-                                <div style="flex:1;">
-                                    <div style="font-size:13px; font-weight:500; color:var(--text-primary);"
-                                        data-i18n="argsToggle">{{ $t('argsToggle') }}</div>
-                                    <div style="font-size:11px; color:var(--text-secondary); opacity:0.8;"
-                                        data-i18n="argsToggleHint">{{ $t('argsToggleHint') }}</div>
-                                </div>
-                            </label>
-
-                            <div style="height:1px; background:var(--border); margin:0 16px;"></div>
-
-                            <!-- API Server Toggle -->
-                            <label class="dev-toggle-item" style="display:flex; align-items:center; gap:14px; padding:14px 16px; cursor:pointer; border-radius:8px; transition:all 0.2s;">
-                                <div class="toggle-switch" style="position:relative; width:44px; height:24px; flex-shrink:0;">
-                                    <input type="checkbox" :checked="settingsStore.enableApiServer"
-                                        style="opacity:0; width:0; height:0; position:absolute;"
-                                        @change="e => settingsStore.toggleApiServer(e.target.checked)">
-                                    <div class="toggle-track" :style="{ background: settingsStore.enableApiServer ? 'var(--accent)' : 'var(--border)' }"
-                                        style="position:absolute; inset:0; border-radius:12px; transition:0.3s;">
-                                    </div>
-                                    <div class="toggle-knob" :style="{ left: settingsStore.enableApiServer ? '22px' : '2px' }"
-                                        style="position:absolute; top:2px; width:20px; height:20px; background:#fff; border-radius:50%; transition:0.3s; box-shadow:0 2px 4px rgba(0,0,0,0.2);">
-                                    </div>
-                                </div>
-                                <div style="flex:1;">
-                                    <div style="font-size:13px; font-weight:500; color:var(--text-primary);"
-                                        data-i18n="apiToggle">{{ $t('apiToggle') }}</div>
-                                    <div style="font-size:11px; color:var(--text-secondary); opacity:0.8;"
-                                        data-i18n="apiToggleHint">{{ $t('apiToggleHint') }}</div>
-                                </div>
-                                <span v-if="settingsStore.apiStarting"
-                                    style="font-size:10px; padding:3px 8px; background:rgba(243,156,18,0.18); color:#f39c12; border-radius:10px; font-weight:600;">● {{ $t('apiStarting') }}</span>
-                                <span v-else-if="settingsStore.apiRunning"
-                                    style="font-size:10px; padding:3px 8px; background:rgba(76,175,80,0.2); color:#4CAF50; border-radius:10px; font-weight:500;">● Live</span>
-                            </label>
-
-                            <!-- API Port Config (shown when enabled) -->
-                            <div v-if="settingsStore.enableApiServer"
-                                style="padding:12px 16px; margin:4px 12px 12px; background:var(--input-bg); border-radius:8px; border:1px solid var(--border);">
-                                <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
-                                    <code style="font-size:12px; color:var(--accent);">http://localhost:{{ settingsStore.apiPort }}</code>
-                                    <input type="number" v-model.number="tempApiPort" min="1024" max="65535"
-                                        style="width:80px; padding:6px 10px; border-radius:6px; border:1px solid var(--border); background:var(--input-bg); color:var(--text-primary); font-size:12px;">
-                                    <button class="outline" @click="handleSaveApiPort" :disabled="settingsStore.apiStarting"
-                                        style="padding:6px 14px; font-size:11px;">Apply</button>
-                                    <a href="#" @click.prevent="handleOpenApiDocs"
-                                        style="font-size:11px; color:var(--accent); margin-left:auto;"
-                                        data-i18n="apiDocs">📄 Docs</a>
-                                </div>
-                                <div v-if="settingsStore.apiStarting"
-                                    style="margin-top:10px; font-size:11px; color:var(--text-secondary);">
-                                    {{ $t('apiStartingHint') }}
-                                </div>
+                        <div v-for="(bookmark, index) in settingsStore.defaultBookmarks" :key="bookmark.id || index" class="default-bookmark-item">
+                            <div class="default-bookmark-fields">
+                                <input v-model="bookmark.name" type="text" :placeholder="$t('defaultBookmarkNamePlaceholder')" maxlength="200">
+                                <input v-model="bookmark.url" type="url" placeholder="https://example.com" spellcheck="false">
                             </div>
-
-                            <div style="height:1px; background:var(--border); margin:0 16px;"></div>
-
-                            <!-- Window Close Behavior -->
-                            <div style="padding:14px 16px;">
-                                <div style="font-size:13px; font-weight:500; color:var(--text-primary);"
-                                    data-i18n="closeBehaviorTitle">{{ $t('closeBehaviorTitle') }}</div>
-                                <div style="font-size:11px; color:var(--text-secondary); opacity:0.8; margin-top:4px;"
-                                    data-i18n="closeBehaviorHint">{{ $t('closeBehaviorHint') }}</div>
-                                <div style="margin-top:8px;">
-                                    <select :value="settingsStore.closeBehavior"
-                                        style="width:100%; max-width:260px; margin:0; font-size:12px; padding:7px 10px;"
-                                        @change="(e) => settingsStore.setCloseBehavior(e.target.value)">
-                                        <option value="tray" data-i18n="closeBehaviorTray">{{ $t('closeBehaviorTray') }}</option>
-                                        <option value="quit" data-i18n="closeBehaviorQuit">{{ $t('closeBehaviorQuit') }}</option>
-                                    </select>
-                                </div>
-                            </div>
+                            <button class="danger outline default-bookmark-remove" type="button" @click="removeDefaultBookmark(index)" :title="$t('defaultBookmarkRemove')">×</button>
                         </div>
                     </div>
 
-                    <!-- Watermark Style Section -->
-                    <div style="margin-bottom: 25px;">
-                        <h4 style="margin-bottom:10px; color:var(--text-primary); font-size:14px;"
-                            data-i18n="watermarkTitle">{{ $t('watermarkTitle') }}</h4>
-                        <p style="font-size:12px; opacity:0.7; margin-bottom:15px;" data-i18n="watermarkDesc">
-                            {{ $t('watermarkDesc') }}
-                        </p>
+                    <button class="outline default-bookmark-add" type="button" @click="addDefaultBookmark">
+                        + {{ $t('defaultBookmarkAdd') }}
+                    </button>
 
-                        <div style="display:flex; flex-direction:column; gap:12px;">
-                            <label :style="{ borderColor: settingsStore.watermarkStyle === 'off' ? 'var(--accent)' : 'var(--border)' }"
-                                style="display:flex; align-items:flex-start; gap:10px; padding:12px; border:1px solid; border-radius:6px; cursor:pointer; transition:0.2s;">
-                                <input type="radio" name="watermarkStyle" value="off"
-                                    style="margin-top:3px; width:auto; cursor:pointer;"
-                                    :checked="settingsStore.watermarkStyle === 'off'"
-                                    @change="settingsStore.saveWatermarkStyle('off')">
-                                <div style="flex:1;">
-                                    <div style="font-weight:bold; margin-bottom:5px; color:var(--text-primary);"
-                                        data-i18n="watermarkOffLabel">
-                                        {{ $t('watermarkOffLabel') }}
-                                    </div>
-                                    <div style="font-size:11px; color:var(--text-secondary); line-height:1.5;"
-                                        data-i18n="watermarkOffDesc">
-                                        {{ $t('watermarkOffDesc') }}
-                                    </div>
-                                </div>
-                            </label>
+                    <div class="default-bookmark-scope">
+                        <div class="default-bookmark-label">{{ $t('defaultBookmarkScopeTitle') }}</div>
+                        <label class="default-bookmark-radio">
+                            <input v-model="settingsStore.defaultBookmarkScope.mode" type="radio" value="all">
+                            <span>{{ $t('defaultBookmarkScopeAll') }}</span>
+                        </label>
+                        <label class="default-bookmark-radio">
+                            <input v-model="settingsStore.defaultBookmarkScope.mode" type="radio" value="includeTags">
+                            <span>{{ $t('defaultBookmarkScopeInclude') }}</span>
+                        </label>
+                        <label class="default-bookmark-radio">
+                            <input v-model="settingsStore.defaultBookmarkScope.mode" type="radio" value="excludeTags">
+                            <span>{{ $t('defaultBookmarkScopeExclude') }}</span>
+                        </label>
 
-                            <!-- 方案5: 增强水印 (默认) -->
-                            <label :style="{ borderColor: settingsStore.watermarkStyle === 'enhanced' ? 'var(--accent)' : 'var(--border)' }"
-                                style="display:flex; align-items:flex-start; gap:10px; padding:12px; border:1px solid; border-radius:6px; cursor:pointer; transition:0.2s;">
-                                <input type="radio" name="watermarkStyle" value="enhanced"
-                                    style="margin-top:3px; width:auto; cursor:pointer;"
-                                    :checked="settingsStore.watermarkStyle === 'enhanced'"
-                                    @change="settingsStore.saveWatermarkStyle('enhanced')">
-                                <div style="flex:1;">
-                                    <div style="font-weight:bold; margin-bottom:5px; color:var(--text-primary);"
-                                        data-i18n="watermarkEnhancedLabel">
-                                        {{ $t('watermarkEnhancedLabel') }}
-                                    </div>
-                                    <div style="font-size:11px; color:var(--text-secondary); line-height:1.5;"
-                                        data-i18n="watermarkEnhancedDesc">
-                                        {{ $t('watermarkEnhancedDesc') }}
-                                    </div>
-                                </div>
-                            </label>
-
-                            <!-- 方案1: 顶部横幅 -->
-                            <label :style="{ borderColor: settingsStore.watermarkStyle === 'banner' ? 'var(--accent)' : 'var(--border)' }"
-                                style="display:flex; align-items:flex-start; gap:10px; padding:12px; border:1px solid; border-radius:6px; cursor:pointer; transition:0.2s;">
-                                <input type="radio" name="watermarkStyle" value="banner"
-                                    style="margin-top:3px; width:auto; cursor:pointer;"
-                                    :checked="settingsStore.watermarkStyle === 'banner'"
-                                    @change="settingsStore.saveWatermarkStyle('banner')">
-                                <div style="flex:1;">
-                                    <div style="font-weight:bold; margin-bottom:5px; color:var(--text-primary);"
-                                        data-i18n="watermarkBannerLabel">
-                                        {{ $t('watermarkBannerLabel') }}
-                                    </div>
-                                    <div style="font-size:11px; color:var(--text-secondary); line-height:1.5;"
-                                        data-i18n="watermarkBannerDesc">
-                                        {{ $t('watermarkBannerDesc') }}
-                                    </div>
-                                </div>
+                        <div v-if="settingsStore.defaultBookmarkScope.mode !== 'all'" class="default-bookmark-tags">
+                            <div class="default-bookmark-tag-input-row">
+                                <input
+                                    v-model="bookmarkTagDraft"
+                                    type="text"
+                                    :placeholder="$t('defaultBookmarkTagPlaceholder')"
+                                    @keydown.enter.prevent="addBookmarkTag">
+                                <button class="outline" type="button" @click="addBookmarkTag">{{ $t('defaultBookmarkTagAdd') }}</button>
+                            </div>
+                            <div v-if="bookmarkTagOptions.length === 0" class="default-bookmark-empty">{{ $t('defaultBookmarkNoTags') }}</div>
+                            <label v-for="tag in bookmarkTagOptions" :key="tag" class="default-bookmark-tag">
+                                <input type="checkbox" :checked="settingsStore.defaultBookmarkScope.tags.includes(tag)" @change="toggleBookmarkTag(tag, $event)">
+                                <span>{{ tag }}</span>
                             </label>
                         </div>
                     </div>
 
-                    <!-- Data Directory Section -->
-                    <div style="margin-bottom: 25px;">
-                        <h4 style="margin-bottom:10px; color:var(--text-primary); font-size:14px;"
-                            data-i18n="dataPathTitle">{{ $t('dataPathTitle') }}</h4>
-                        <p style="font-size:12px; opacity:0.7; margin-bottom:15px;" data-i18n="dataPathDesc">
-                            {{ $t('dataPathDesc') }}
-                        </p>
-
-                        <div style="background:rgba(0,0,0,0.2); border:1px solid var(--border); border-radius:8px; padding:15px;">
-                            <div style="margin-bottom:12px;">
-                                <label style="font-size:11px; opacity:0.6; margin-bottom:5px; display:block;"
-                                    data-i18n="dataPathCurrent">{{ $t('dataPathCurrent') }}</label>
-                                <div id="currentDataPath"
-                                    style="font-size:12px; font-family:monospace; background:rgba(0,0,0,0.3); padding:8px 12px; border-radius:6px; word-break:break-all; color:var(--accent);">
-                                    {{ settingsStore.currentDataPath || 'Loading...' }}
-                                </div>
-                            </div>
-
-                            <div style="display:flex; gap:10px; flex-wrap:wrap;">
-                                <button class="outline" @click="handleSelectDataDirectory" style="flex:1; min-width:120px;"
-                                    data-i18n="dataPathBrowse">
-                                    {{ $t('dataPathBrowse') }}
-                                </button>
-                                <button v-if="!settingsStore.isDefaultDataPath" class="outline" @click="handleResetDataDirectory"
-                                    style="flex:1; min-width:120px;" data-i18n="dataPathReset">
-                                    {{ $t('dataPathReset') }}
-                                </button>
-                            </div>
-
-                            <div v-if="showRestartWarning" style="margin-top:12px; padding:10px; background:rgba(255,193,7,0.1); border:1px solid rgba(255,193,7,0.3); border-radius:6px;">
-                                <div style="display:flex; align-items:center; gap:8px;">
-                                    <span style="font-size:16px;">⚠️</span>
-                                    <span style="font-size:11px; color:var(--warning);"
-                                        data-i18n="dataPathRestart">{{ $t('dataPathRestart') }}</span>
-                                </div>
-                            </div>
-                        </div>
+                    <div class="default-bookmark-actions">
+                        <span class="default-bookmark-hint">{{ $t('defaultBookmarkHint') }}</span>
+                        <button class="primary" type="button" @click="handleSaveDefaultBookmarks">{{ $t('defaultBookmarkSave') }}</button>
                     </div>
                 </div>
+
+                <!-- Default Passwords Tab -->
+                <div v-if="settingsStore.activeTab === 'default-passwords'" class="settings-section">
+                    <h3 style="margin-bottom:10px; color:var(--accent);">{{ $t('defaultPasswordTitle') }}</h3>
+                    <p class="default-bookmark-desc">{{ $t('defaultPasswordDesc') }}</p>
+
+                    <div class="default-password-list">
+                        <div v-if="settingsStore.defaultPasswords.length === 0" class="default-bookmark-empty">
+                            {{ $t('defaultPasswordEmpty') }}
+                        </div>
+                        <div v-for="(entry, index) in settingsStore.defaultPasswords" :key="entry.id || index" class="default-password-item">
+                            <div class="default-password-header">
+                                <span>{{ $t('defaultPasswordEntry') }} {{ index + 1 }}</span>
+                                <button class="danger outline default-bookmark-remove" type="button" @click="removeDefaultPassword(index)" :title="$t('defaultPasswordRemove')">×</button>
+                            </div>
+                            <div class="default-password-fields">
+                                <input v-model="entry.name" type="text" :placeholder="$t('defaultPasswordNamePlaceholder')" maxlength="200">
+                                <input v-model="entry.url" type="url" placeholder="https://example.com" spellcheck="false">
+                                <input v-model="entry.username" type="text" :placeholder="$t('defaultPasswordUsernamePlaceholder')" autocomplete="off">
+                                <input v-model="entry.password" type="password" :placeholder="$t('defaultPasswordPasswordPlaceholder')" autocomplete="new-password">
+                            </div>
+                            <textarea v-model="entry.notes" class="default-password-notes" :placeholder="$t('defaultPasswordNotesPlaceholder')" rows="2"></textarea>
+                            <label class="default-password-two-factor">
+                                <input v-model="entry.twoFactorEnabled" type="checkbox">
+                                <span>{{ $t('defaultPasswordTwoFactor') }}</span>
+                            </label>
+                            <input v-if="entry.twoFactorEnabled" v-model="entry.twoFactorSecret" class="default-password-secret" type="password" :placeholder="$t('defaultPasswordSecretPlaceholder')" autocomplete="off" spellcheck="false">
+                        </div>
+                    </div>
+
+                    <button class="outline default-bookmark-add" type="button" @click="addDefaultPassword">
+                        + {{ $t('defaultPasswordAdd') }}
+                    </button>
+
+                    <div class="default-bookmark-scope">
+                        <div class="default-bookmark-label">{{ $t('defaultPasswordScopeTitle') }}</div>
+                        <label class="default-bookmark-radio">
+                            <input v-model="settingsStore.defaultPasswordScope.mode" type="radio" value="all">
+                            <span>{{ $t('defaultBookmarkScopeAll') }}</span>
+                        </label>
+                        <label class="default-bookmark-radio">
+                            <input v-model="settingsStore.defaultPasswordScope.mode" type="radio" value="includeTags">
+                            <span>{{ $t('defaultBookmarkScopeInclude') }}</span>
+                        </label>
+                        <label class="default-bookmark-radio">
+                            <input v-model="settingsStore.defaultPasswordScope.mode" type="radio" value="excludeTags">
+                            <span>{{ $t('defaultBookmarkScopeExclude') }}</span>
+                        </label>
+
+                        <div v-if="settingsStore.defaultPasswordScope.mode !== 'all'" class="default-bookmark-tags">
+                            <div class="default-bookmark-tag-input-row">
+                                <input
+                                    v-model="passwordTagDraft"
+                                    type="text"
+                                    :placeholder="$t('defaultBookmarkTagPlaceholder')"
+                                    @keydown.enter.prevent="addPasswordTag">
+                                <button class="outline" type="button" @click="addPasswordTag">{{ $t('defaultBookmarkTagAdd') }}</button>
+                            </div>
+                            <div v-if="passwordTagOptions.length === 0" class="default-bookmark-empty">{{ $t('defaultBookmarkNoTags') }}</div>
+                            <label v-for="tag in passwordTagOptions" :key="tag" class="default-bookmark-tag">
+                                <input type="checkbox" :checked="settingsStore.defaultPasswordScope.tags.includes(tag)" @change="togglePasswordTag(tag, $event)">
+                                <span>{{ tag }}</span>
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="default-bookmark-actions">
+                        <span class="default-bookmark-hint">{{ $t('defaultPasswordHint') }}</span>
+                        <button class="primary" type="button" @click="handleSaveDefaultPasswords">{{ $t('defaultPasswordSave') }}</button>
+                    </div>
+                </div>
+
+                <AdvancedSettings v-if="uiStore.settingsModalVisible && settingsStore.activeTab === 'advanced'" />
             </div>
 
             <div class="modal-footer">
@@ -398,17 +282,16 @@
 </template>
 
 <script setup>
-import { ref, onMounted, watch } from 'vue';
+import { ref, computed, onMounted, watch } from 'vue';
 import { useUIStore } from '../store/useUIStore';
 import { useSettingsStore } from '../store/useSettingsStore';
 import { settingService } from '../services/setting.service';
 import { ipcService } from '../services/ipc.service';
+import AdvancedSettings from './AdvancedSettings.vue';
 
 const uiStore = useUIStore();
 const settingsStore = useSettingsStore();
 
-const tempApiPort = ref(12138);
-const showRestartWarning = ref(false);
 const showStoreSearch = ref(false);
 const storeSearchQuery = ref('');
 const storeSearchResults = ref([]);
@@ -419,6 +302,38 @@ const installingStoreId = ref('');
 const installProgressPercent = ref(0);
 const installProgressMessage = ref('');
 const scopeGroupState = ref({});
+const bookmarkTagDraft = ref('');
+const passwordTagDraft = ref('');
+
+const bookmarkTagOptions = computed(() => {
+    const tags = new Set();
+    for (const profile of Array.isArray(profileOptions.value) ? profileOptions.value : []) {
+        for (const tag of Array.isArray(profile?.tags) ? profile.tags : []) {
+            const value = String(tag || '').trim();
+            if (value) tags.add(value);
+        }
+    }
+    for (const tag of Array.isArray(settingsStore.defaultBookmarkScope?.tags) ? settingsStore.defaultBookmarkScope.tags : []) {
+        const value = String(tag || '').trim();
+        if (value) tags.add(value);
+    }
+    return Array.from(tags).sort((a, b) => a.localeCompare(b));
+});
+
+const passwordTagOptions = computed(() => {
+    const tags = new Set();
+    for (const profile of Array.isArray(profileOptions.value) ? profileOptions.value : []) {
+        for (const tag of Array.isArray(profile?.tags) ? profile.tags : []) {
+            const value = String(tag || '').trim();
+            if (value) tags.add(value);
+        }
+    }
+    for (const tag of Array.isArray(settingsStore.defaultPasswordScope?.tags) ? settingsStore.defaultPasswordScope.tags : []) {
+        const value = String(tag || '').trim();
+        if (value) tags.add(value);
+    }
+    return Array.from(tags).sort((a, b) => a.localeCompare(b));
+});
 
 onMounted(async () => {
     settingService.onExtensionInstallProgress((payload) => {
@@ -436,9 +351,9 @@ onMounted(async () => {
     await handleSearchStore();
 });
 
-watch(() => settingsStore.apiPort, (newVal) => {
-    tempApiPort.value = newVal;
-}, { immediate: true });
+watch(() => uiStore.settingsModalVisible, (visible) => {
+    if (visible) loadProfileOptions();
+});
 
 const handleSelectExtension = async () => {
     const path = await settingService.selectExtensionFolder();
@@ -515,6 +430,160 @@ const handleExtensionScopeChange = async (ext, mode) => {
         await settingsStore.updateExtensionScope(ext.id, applyMode, profileIds);
     } catch (e) {
         uiStore.showAlert(`保存范围失败: ${e.message}`);
+    }
+};
+
+const createBookmarkId = () => window.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+const addDefaultBookmark = () => {
+    settingsStore.defaultBookmarks.push({ id: createBookmarkId(), name: '', url: '' });
+};
+
+const removeDefaultBookmark = (index) => {
+    settingsStore.defaultBookmarks.splice(index, 1);
+};
+
+const toggleBookmarkTag = (tag, event) => {
+    const selected = new Set(settingsStore.defaultBookmarkScope.tags || []);
+    if (event?.target?.checked) selected.add(tag);
+    else selected.delete(tag);
+    settingsStore.defaultBookmarkScope = {
+        ...settingsStore.defaultBookmarkScope,
+        tags: Array.from(selected)
+    };
+};
+
+const addBookmarkTag = () => {
+    const values = String(bookmarkTagDraft.value || '')
+        .split(/[,，]/)
+        .map(tag => tag.trim())
+        .filter(Boolean);
+    if (values.length === 0) return;
+    const selected = new Set(settingsStore.defaultBookmarkScope.tags || []);
+    values.forEach(tag => selected.add(tag));
+    settingsStore.defaultBookmarkScope = {
+        ...settingsStore.defaultBookmarkScope,
+        tags: Array.from(selected)
+    };
+    bookmarkTagDraft.value = '';
+};
+
+const addDefaultPassword = () => {
+    settingsStore.defaultPasswords.push({
+        id: createBookmarkId(),
+        name: '',
+        url: '',
+        username: '',
+        password: '',
+        notes: '',
+        twoFactorEnabled: false,
+        twoFactorSecret: ''
+    });
+};
+
+const removeDefaultPassword = (index) => {
+    settingsStore.defaultPasswords.splice(index, 1);
+};
+
+const togglePasswordTag = (tag, event) => {
+    const selected = new Set(settingsStore.defaultPasswordScope.tags || []);
+    if (event?.target?.checked) selected.add(tag);
+    else selected.delete(tag);
+    settingsStore.defaultPasswordScope = {
+        ...settingsStore.defaultPasswordScope,
+        tags: Array.from(selected)
+    };
+};
+
+const addPasswordTag = () => {
+    const values = String(passwordTagDraft.value || '')
+        .split(/[,，]/)
+        .map(tag => tag.trim())
+        .filter(Boolean);
+    if (values.length === 0) return;
+    const selected = new Set(settingsStore.defaultPasswordScope.tags || []);
+    values.forEach(tag => selected.add(tag));
+    settingsStore.defaultPasswordScope = {
+        ...settingsStore.defaultPasswordScope,
+        tags: Array.from(selected)
+    };
+    passwordTagDraft.value = '';
+};
+
+const handleSaveDefaultPasswords = async () => {
+    const passwords = [];
+    for (const entry of settingsStore.defaultPasswords) {
+        const urlText = String(entry?.url || '').trim();
+        let url;
+        try {
+            url = new URL(urlText);
+        } catch (error) {
+            uiStore.showAlert(window.t('defaultPasswordUrlInvalid'));
+            return;
+        }
+        if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
+            uiStore.showAlert(window.t('defaultPasswordUrlInvalid'));
+            return;
+        }
+        if (!String(entry?.username || '').trim() || !String(entry?.password || '')) {
+            uiStore.showAlert(window.t('defaultPasswordCredentialsRequired'));
+            return;
+        }
+        if (entry.twoFactorEnabled && !String(entry?.twoFactorSecret || '').trim()) {
+            uiStore.showAlert(window.t('defaultPasswordSecretRequired'));
+            return;
+        }
+        passwords.push({
+            id: String(entry.id || createBookmarkId()),
+            name: String(entry.name || '').trim() || url.hostname,
+            url: url.href,
+            username: String(entry.username || '').trim(),
+            password: String(entry.password || ''),
+            notes: String(entry.notes || ''),
+            twoFactorEnabled: !!entry.twoFactorEnabled,
+            twoFactorSecret: entry.twoFactorEnabled ? String(entry.twoFactorSecret || '').trim() : ''
+        });
+    }
+
+    try {
+        await settingsStore.saveDefaultPasswords(passwords, settingsStore.defaultPasswordScope);
+        uiStore.showAlert(window.t('defaultPasswordSaved'));
+    } catch (error) {
+        uiStore.showAlert(`${window.t('defaultPasswordSaveFailed')}${error.message || ''}`);
+    }
+};
+
+const handleSaveDefaultBookmarks = async () => {
+    const bookmarks = [];
+    for (const bookmark of settingsStore.defaultBookmarks) {
+        const url = String(bookmark?.url || '').trim();
+        if (!url) {
+            uiStore.showAlert(window.t('defaultBookmarkUrlRequired'));
+            return;
+        }
+        let parsed;
+        try {
+            parsed = new URL(url);
+        } catch (error) {
+            uiStore.showAlert(window.t('defaultBookmarkUrlInvalid'));
+            return;
+        }
+        if (!['http:', 'https:'].includes(parsed.protocol)) {
+            uiStore.showAlert(window.t('defaultBookmarkUrlInvalid'));
+            return;
+        }
+        bookmarks.push({
+            id: String(bookmark.id || createBookmarkId()),
+            name: String(bookmark.name || '').trim() || parsed.hostname,
+            url
+        });
+    }
+
+    try {
+        await settingsStore.saveDefaultBookmarks(bookmarks, settingsStore.defaultBookmarkScope);
+        uiStore.showAlert(window.t('defaultBookmarkSaved'));
+    } catch (error) {
+        uiStore.showAlert(`${window.t('defaultBookmarkSaveFailed')}${error.message || ''}`);
     }
 };
 
@@ -619,53 +688,12 @@ const toggleProfileCard = async (ext, profileId) => {
     }
 };
 
-const handleSaveApiPort = async () => {
-    if (tempApiPort.value < 1024 || tempApiPort.value > 65535) {
-        uiStore.showAlert(window.t('apiPortInvalid'));
-        return;
-    }
-    await settingsStore.saveApiPort(tempApiPort.value);
-    uiStore.showAlert(window.t('apiPortSaved'));
-};
-
-const handleOpenApiDocs = () => {
-    ipcService.openUrl('https://browser.geekez.net/doc.html#doc-api');
-};
-
-const handleSelectDataDirectory = async () => {
-    const path = await settingService.selectDataDirectory();
-    if (!path) return;
-
-    uiStore.showConfirm(window.t('dataPathConfirmMigrate'), async () => {
-        uiStore.showAlert(window.t('dataPathMigrating'), false);
-        try {
-            const res = await settingService.setDataDirectory(path, true);
-            if (res.success) {
-                showRestartWarning.value = true;
-                uiStore.showAlert(window.t('dataPathSuccess'));
-            } else {
-                uiStore.showAlert(window.t('dataPathError') + res.error);
-            }
-        } catch (e) {
-            uiStore.showAlert(window.t('dataPathError') + e.message);
-        }
-    });
-};
-
-const handleResetDataDirectory = async () => {
-    uiStore.showConfirm(window.t('dataPathConfirmReset'), async () => {
-        const res = await settingService.resetDataDirectory();
-        if (res.success) {
-            showRestartWarning.value = true;
-            uiStore.showAlert(window.t('dataPathResetSuccess'));
-        }
-    });
-};
-
-
 </script>
 
 <style scoped>
+#settingsModal .modal-content { width: 660px; max-width: calc(100vw - 32px); }
+#settingsModal .tab-header { flex-wrap: wrap; flex-shrink: 0; }
+#settingsModal .tab-btn { font-size: 12px; padding: 12px 10px; white-space: normal; text-align: center; }
 .ext-item {
     display: flex;
     justify-content: space-between;
@@ -675,10 +703,6 @@ const handleResetDataDirectory = async () => {
     border: 1px solid var(--border);
     border-radius: 6px;
     margin-bottom: 8px;
-}
-
-.dev-toggle-item:hover {
-    background: rgba(255, 255, 255, 0.05);
 }
 
 .ext-install-toolbar {
@@ -846,6 +870,217 @@ const handleResetDataDirectory = async () => {
     font-size: 12px;
     opacity: 0.65;
     line-height: 1;
+}
+
+.default-bookmark-desc,
+.default-bookmark-hint {
+    font-size: 12px;
+    opacity: 0.7;
+    line-height: 1.5;
+}
+
+.default-bookmark-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.default-bookmark-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.08);
+}
+
+.default-bookmark-fields {
+    display: grid;
+    grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+    gap: 8px;
+    flex: 1;
+    min-width: 0;
+}
+
+.default-bookmark-fields input {
+    min-width: 0;
+    margin: 0;
+}
+
+.default-bookmark-remove {
+    width: 30px;
+    min-width: 30px;
+    height: 30px;
+    padding: 0;
+    font-size: 18px;
+    line-height: 1;
+}
+
+.default-bookmark-add {
+    margin-top: 10px;
+    font-size: 12px;
+}
+
+.default-password-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.default-password-item {
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.08);
+}
+
+.default-password-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 8px;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.default-password-fields {
+    display: grid;
+    grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
+    gap: 8px;
+}
+
+.default-password-fields input,
+.default-password-notes,
+.default-password-secret {
+    min-width: 0;
+    margin: 0;
+}
+
+.default-password-notes {
+    display: block;
+    margin-top: 8px;
+    resize: vertical;
+}
+
+.default-password-two-factor {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 8px;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.default-password-two-factor input {
+    width: auto;
+    margin: 0;
+}
+
+.default-password-secret {
+    display: block;
+    margin-top: 8px;
+}
+
+.default-bookmark-scope {
+    margin-top: 18px;
+    padding: 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.08);
+}
+
+.default-bookmark-label {
+    font-size: 12px;
+    font-weight: 600;
+    margin-bottom: 8px;
+}
+
+.default-bookmark-radio {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin: 0 14px 6px 0;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.default-bookmark-radio input,
+.default-bookmark-tag input {
+    width: auto;
+    margin: 0;
+}
+
+.default-bookmark-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px 10px;
+    margin-top: 6px;
+    padding-top: 8px;
+    border-top: 1px solid var(--border);
+}
+
+.default-bookmark-tag-input-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 8px;
+    width: 100%;
+}
+
+.default-bookmark-tag-input-row input {
+    min-width: 0;
+    margin: 0;
+}
+
+.default-bookmark-tag-input-row button {
+    margin: 0;
+    white-space: nowrap;
+    font-size: 12px;
+}
+
+.default-bookmark-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.default-bookmark-empty {
+    padding: 14px;
+    text-align: center;
+    font-size: 12px;
+    opacity: 0.6;
+    border: 1px dashed var(--border);
+    border-radius: 6px;
+}
+
+.default-bookmark-actions {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-top: 18px;
+}
+
+.default-bookmark-actions button {
+    flex-shrink: 0;
+}
+
+@media (max-width: 540px) {
+    .default-bookmark-fields {
+        grid-template-columns: 1fr;
+    }
+
+    .default-password-fields {
+        grid-template-columns: 1fr;
+    }
+
+    .default-bookmark-actions {
+        align-items: flex-start;
+        flex-direction: column;
+    }
 }
 
 </style>

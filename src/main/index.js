@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, dialog, screen, shell, Tray, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, dialog, screen, shell, Tray, Menu, nativeImage, powerMonitor, safeStorage, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs-extra');
 const { spawn, exec, execSync } = require('child_process');
@@ -16,10 +16,36 @@ const chromiumLocator = require('./chromium-path');
 const { CLOSE_BEHAVIOR, decideCloseAction, normalizeCloseBehavior } = require('./close-behavior');
 const { fetchLatestGitHubReleaseInfo } = require('./release-check');
 const xrayRelease = require('./xray-assets');
+const { supportsNativeGlass, getMainWindowMaterialOptions } = require('./native-glass');
+const { allocateLocalProxyPort, isXrayLocalBindFailure } = require('./local-proxy-port');
+const { createProfileSync } = require('./profile-sync');
+const { normalizePasskeyStore, createPasskeyManager } = require('./passkeys');
+const { resolveConfiguredLanguage, resolveSystemLanguage } = require('./language');
+const {
+    authorizeLocalRequest,
+    createApiToken,
+    extensionOriginForPath,
+    extractBearerToken,
+    getRequestOrigin,
+    isAllowedInternalPreflight,
+    readRequestBody,
+    secretsEqual,
+    sendForbidden,
+    setInternalCorsHeaders,
+    setJsonSecurityHeaders
+} = require('./local-api-security');
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
 const initSqlJs = require('sql.js');
 const { SocksClient } = require('socks');
+
+function handleProcessStreamError(error) {
+    if (error?.code === 'EPIPE') return;
+    throw error;
+}
+
+process.stdout?.on?.('error', handleProcessStreamError);
+process.stderr?.on?.('error', handleProcessStreamError);
 
 const uuidv4 = () => crypto.randomUUID();
 
@@ -65,7 +91,12 @@ async function createSocksProxyAgent(proxyUrl) {
 // Only disable if GPU compatibility issues occur
 
 import { generateXrayConfig, parseProxyLink, getProxyRemark } from './utils';
-import { generateFingerprint, getInjectScript, getGeolocationScript, getWatermarkScript } from './fingerprint';
+import { generateFingerprint, getInjectScript } from './fingerprint';
+const { installWorkerFingerprint } = require('./worker-fingerprint');
+import guardBackground from './guard/background.js?raw';
+import guardPasswordContent from './guard/content-passwords.js?raw';
+import guardPopupHtml from './guard/popup.html?raw';
+import guardPopupScript from './guard/popup.js?raw';
 
 const isDev = !app.isPackaged;
 const RESOURCES_BIN = isDev ? path.join(app.getAppPath(), 'resources', 'bin') : path.join(process.resourcesPath, 'bin');
@@ -100,6 +131,7 @@ const DATA_PATH = getCustomDataPath();
 const TRASH_PATH = path.join(app.getPath('userData'), '_Trash_Bin');
 const PROFILES_FILE = path.join(DATA_PATH, 'profiles.json');
 const SETTINGS_FILE = path.join(DATA_PATH, 'settings.json');
+const DEFAULT_PASSWORDS_FILE = path.join(DATA_PATH, 'default-passwords.json');
 const USER_EXTENSIONS_DIR = path.join(DATA_PATH, '_extensions');
 
 fs.ensureDirSync(DATA_PATH);
@@ -153,9 +185,23 @@ const EXTENSION_STORE_CATALOG = [
 
 let activeProcesses = {};
 let launchingProfiles = new Set();
+let xrayUpdateInProgress = false;
+const profileResourceWrites = new Set();
+let profileApiQueue = Promise.resolve();
+let configSync = null;
+const passkeyRuntimes = new Map();
+
+function runProfileApiTask(task) {
+    const result = profileApiQueue.then(task);
+    profileApiQueue = result.catch(() => { });
+    return result;
+}
+
 const runtimeProfileLanguageStates = new Map();
 let apiServer = null;
 let apiServerRunning = false;
+const publicApiToken = createApiToken();
+let exportApiGrant = null;
 let mainWindow = null; // Global reference for API-to-UI communication
 let appTray = null;
 let isAppQuitting = false;
@@ -166,41 +212,37 @@ let cachedCloseBehavior = CLOSE_BEHAVIOR.TRAY;
 // ============================================================================
 function createApiServer(port) {
     const server = http.createServer(async (req, res) => {
-        // CORS headers
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-        res.setHeader('Content-Type', 'application/json');
-
-        if (req.method === 'OPTIONS') {
-            res.writeHead(200);
-            res.end();
-            return;
-        }
-
-        const url = new URL(req.url, `http://localhost:${port}`);
-        const pathname = url.pathname;
-        const method = req.method;
-
-        // Parse body for POST/PUT
-        let body = '';
-        if (method === 'POST' || method === 'PUT') {
-            body = await new Promise(resolve => {
-                let data = '';
-                req.on('data', chunk => data += chunk);
-                req.on('end', () => resolve(data));
-            });
-        }
+        setJsonSecurityHeaders(res);
+        const authorization = authorizeLocalRequest(req, publicApiToken);
+        if (!authorization.ok) return sendForbidden(res);
 
         try {
-            const result = await handleApiRequest(method, pathname, body, url.searchParams, { req, res });
+            const url = new URL(req.url, `http://localhost:${port}`);
+            const pathname = url.pathname;
+            const method = req.method;
+
+            const isExportRoute = /^\/api\/export(?:\/|$)/.test(pathname);
+            if (isExportRoute) {
+                const exportToken = String(req.headers['x-geekez-export-token'] || '');
+                if (!exportApiGrant || exportApiGrant.expiresAt <= Date.now() ||
+                    !secretsEqual(exportToken, exportApiGrant.token)) {
+                    return sendForbidden(res);
+                }
+            }
+
+            let body = '';
+            if (method === 'POST' || method === 'PUT') {
+                body = await readRequestBody(req, 32 * 1024 * 1024);
+            }
+
+            const result = await handleApiRequest(method, pathname, body, url.searchParams, { req, res, exportAuthorized: isExportRoute });
             if (result && result.__streamHandled) {
                 return;
             }
             res.writeHead(result.status || 200);
             res.end(JSON.stringify(result.data || result));
         } catch (err) {
-            console.error('API Error:', err);
+            console.error('API Error:', err.statusCode || err.name);
             res.writeHead(err.status || err.statusCode || 500);
             res.end(JSON.stringify({ success: false, error: err.message }));
         }
@@ -213,7 +255,19 @@ function resolveApiPreferredLang(params, settings = {}) {
     const rawLang = String(params?.get('lang') || '').trim().toLowerCase();
     if (rawLang === 'en') return 'en';
     if (rawLang === 'cn' || rawLang === 'zh' || rawLang === 'zh-cn') return 'cn';
-    return settings.lang === 'en' ? 'en' : 'cn';
+    return resolveSettingsUiLanguage(settings);
+}
+
+function getSystemUiLanguage() {
+    try {
+        return resolveSystemLanguage(app.getLocale ? app.getLocale() : '');
+    } catch (error) {
+        return resolveSystemLanguage('');
+    }
+}
+
+function resolveSettingsUiLanguage(settings = {}) {
+    return resolveConfiguredLanguage(settings, getSystemUiLanguage() === 'cn' ? 'zh-CN' : 'en-US');
 }
 
 function shouldStreamApiOpenRequest(req, params) {
@@ -428,31 +482,66 @@ async function streamApiOpenProfile({ req, res, params, settings, profile, resol
     return { __streamHandled: true };
 }
 
-// 2. 仅用于扩展密码同步的内部服务器 (独立端口 12139，无条件常驻)
+// 2. 扩展密码同步与 2FA 的内部服务器（随机 loopback 端口，无条件常驻）
 let internalApiServer = null;
-const INTERNAL_API_PORT = 12139;
+let internalApiPort = null;
+
+function normalizeTotpSecret(value) {
+    const invalidSecret = () => Object.assign(new Error('请输入有效的 Base32 密钥（至少 16 个字符）'), { statusCode: 400 });
+    if (typeof value !== 'string') throw invalidSecret();
+    const secret = value.replace(/\s+/g, '').toUpperCase().replace(/=+$/, '');
+    if (!/^[A-Z2-7]{16,103}$/.test(secret)) throw invalidSecret();
+    const { ScureBase32Plugin } = require('otplib');
+    let bytes;
+    try {
+        bytes = new ScureBase32Plugin().decode(secret);
+    } catch {
+        throw invalidSecret();
+    }
+    if (bytes.length < 10 || bytes.length > 64) throw invalidSecret();
+    return secret;
+}
 
 function createInternalApiServer() {
     const server = http.createServer(async (req, res) => {
-        res.setHeader('Access-Control-Allow-Origin', '*');
-        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-        res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-        res.setHeader('Content-Type', 'application/json');
+        setJsonSecurityHeaders(res);
+        const origin = getRequestOrigin(req);
+        if (req.method === 'OPTIONS') {
+            const origins = [...passkeyRuntimes.values()].filter(runtime => !runtime.apiRevoked).map(runtime => runtime.extensionOrigin);
+            if (!isAllowedInternalPreflight(req, origins)) return sendForbidden(res);
+            setInternalCorsHeaders(res, origin);
+            res.writeHead(204);
+            return res.end();
+        }
 
-        if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
-
-        const url = new URL(req.url, `http://localhost:${INTERNAL_API_PORT}`);
+        const bearer = extractBearerToken(req);
+        const authenticated = [...passkeyRuntimes.entries()].find(([, runtime]) => !runtime.apiRevoked &&
+            authorizeLocalRequest(req, runtime.token, { allowChromeExtension: true, extensionOrigin: runtime.extensionOrigin }).ok);
+        if (!bearer || !authenticated) return sendForbidden(res);
+        const [authorizedProfileId, authorizedRuntime] = authenticated;
+        setInternalCorsHeaders(res, origin);
+        let url;
+        try {
+            url = new URL(req.url, 'http://127.0.0.1');
+        } catch {
+            return sendForbidden(res);
+        }
+        const sendJson = (status, payload) => {
+            res.writeHead(status);
+            res.end(JSON.stringify(payload));
+        };
+        const authorizeProfile = profileId => {
+            const runtime = passkeyRuntimes.get(profileId);
+            if (profileId !== authorizedProfileId || runtime !== authorizedRuntime || runtime.apiRevoked) return null;
+            return runtime;
+        };
 
         if (req.method === 'GET' && url.pathname === '/api/runtime/language') {
             const profileId = String(url.searchParams.get('profileId') || '').trim();
-            if (!profileId) {
-                res.writeHead(400);
-                return res.end(JSON.stringify({ success: false, error: 'profileId required' }));
-            }
-
+            if (!profileId) return sendJson(400, { success: false, error: 'profileId required' });
+            if (!authorizeProfile(profileId)) return sendForbidden(res);
             const state = getProfileRuntimeLanguageState(profileId);
-            res.writeHead(200);
-            return res.end(JSON.stringify({
+            return sendJson(200, {
                 success: true,
                 profileId,
                 enabled: !!state.enabled,
@@ -461,28 +550,71 @@ function createInternalApiServer() {
                 acceptLanguage: state.acceptLanguageHeader || '',
                 acceptLanguageHeader: state.acceptLanguageHeader || '',
                 updatedAt: state.updatedAt || 0
-            }));
+            });
         }
 
-        if (req.method === 'POST' && url.pathname === '/api/passwords/sync') {
-            let body = await new Promise(resolve => {
-                let data = ''; req.on('data', chunk => data += chunk); req.on('end', () => resolve(data));
-            });
+        if (req.method === 'POST' && ['/api/passkeys/manage', '/generate-totp', '/validate-totp', '/api/passwords/sync'].includes(url.pathname)) {
             try {
-                const data = JSON.parse(body);
-                if (!data.profileId || !data.passwords) {
-                    res.writeHead(400); return res.end(JSON.stringify({ success: false, error: 'profileId and passwords required' }));
+                const bodyLimit = url.pathname === '/api/passwords/sync' ? 32 * 1024 * 1024 : 256 * 1024;
+                const data = JSON.parse(await readRequestBody(req, bodyLimit) || '{}');
+                if (!data || typeof data !== 'object' || Array.isArray(data)) throw Object.assign(new Error('请求格式无效'), { statusCode: 400 });
+                if (typeof data.profileId !== 'string' || !/^[a-zA-Z0-9_-]+$/.test(data.profileId)) {
+                    throw Object.assign(new Error('profileId required'), { statusCode: 400 });
                 }
-                const pwFile = require('path').join(DATA_PATH, data.profileId, 'passwords.json');
-                await require('fs-extra').ensureDir(require('path').dirname(pwFile));
-                await writeEncryptedPasswords(pwFile, data.passwords, data.profileId);
-                res.writeHead(200); res.end(JSON.stringify({ success: true, count: data.passwords.length }));
-            } catch (err) {
-                res.writeHead(500); res.end(JSON.stringify({ success: false, error: err.message }));
+                const runtime = authorizeProfile(data.profileId);
+                if (!runtime) return sendForbidden(res);
+
+                if (url.pathname === '/api/passkeys/manage') {
+                    if (!runtime.manager) throw Object.assign(new Error('环境 Passkey 尚未就绪'), { statusCode: 409 });
+                    let result;
+                    if (data.action === 'list') result = await runtime.manager.summary();
+                    else if (data.action === 'enable') result = await runtime.manager.setEnabled(data.enabled);
+                    else if (data.action === 'authorize') result = await runtime.manager.authorize(data.targetId, data.credentialId, data.mode);
+                    else if (data.action === 'revoke') result = await runtime.manager.revoke();
+                    else if (data.action === 'delete') result = await runtime.manager.remove(data.credentialId);
+                    else throw Object.assign(new Error('无效的 Passkey 操作'), { statusCode: 400 });
+                    return sendJson(200, { success: true, ...result });
+                }
+
+                if (url.pathname === '/generate-totp' || url.pathname === '/validate-totp') {
+                    const secret = normalizeTotpSecret(data.secret);
+                    if (url.pathname === '/validate-totp') return sendJson(200, { success: true, secret });
+                    const { generate, createGuardrails } = require('otplib');
+                    const remaining = 30000 - Date.now() % 30000;
+                    if (remaining < 1500) await new Promise(resolve => setTimeout(resolve, remaining + 20));
+                    const epoch = Math.floor(Date.now() / 1000);
+                    const code = await generate({
+                        secret, epoch, period: 30, digits: 6, algorithm: 'sha1',
+                        guardrails: createGuardrails({ MIN_SECRET_BYTES: 10 })
+                    });
+                    const expiresAt = (Math.floor(epoch / 30) + 1) * 30 * 1000;
+                    return sendJson(200, { success: true, code, expiresAt });
+                }
+
+                if (!Array.isArray(data.passwords)) throw Object.assign(new Error('passwords required'), { statusCode: 400 });
+                await runProfileApiTask(async () => {
+                    if (!authorizeProfile(data.profileId)) throw Object.assign(new Error('Forbidden'), { statusCode: 403 });
+                    const pwFile = path.join(DATA_PATH, data.profileId, 'passwords.json');
+                    const existing = await readEncryptedPasswords(pwFile, data.profileId, { strict: true });
+                    if (existing.some(entry => entry.apiUpdate?.revision && data.apiRevisions?.[entry.id] !== entry.apiUpdate.revision)) {
+                        throw Object.assign(new Error('API 账号更新尚未导入，请关闭并重新启动环境'), { statusCode: 409 });
+                    }
+                    const syncStateFile = path.join(DATA_PATH, data.profileId, 'passwords-sync-state.json');
+                    const syncState = fs.existsSync(syncStateFile) ? await fs.readJson(syncStateFile) : null;
+                    if (syncState?.revision && data.snapshotRevision !== syncState.revision) {
+                        throw Object.assign(new Error('同步密码库尚未导入，请关闭并重新启动环境'), { statusCode: 409 });
+                    }
+                    await fs.ensureDir(path.dirname(pwFile));
+                    await writeEncryptedPasswords(pwFile, data.passwords, data.profileId);
+                });
+                configSync?.schedule();
+                return sendJson(200, { success: true, count: data.passwords.length });
+            } catch (failure) {
+                return sendJson(failure.statusCode || (failure instanceof SyntaxError ? 400 : 500), { success: false, error: failure.message });
             }
-        } else {
-            res.writeHead(404); res.end(JSON.stringify({ success: false, error: 'Endpoint not found' }));
         }
+
+        return sendForbidden(res);
     });
     return server;
 }
@@ -929,88 +1061,194 @@ function buildExtensionInstallShimSource(wrapperRelPath, originalWorkerRelPath, 
         .replace(/\\/g, '/')
         .replace(/'/g, "\\'");
 
-    const shim = `/* __geekez_oninstalled_shim__ */
-/* __geekez_original_worker__:${originalWorkerRelPath} */
-(() => {
+    const shim = `(() => {
   try {
     const runtime = globalThis.chrome?.runtime || globalThis.browser?.runtime;
     const storage = globalThis.chrome?.storage?.local || globalThis.browser?.storage?.local;
     if (!runtime?.onInstalled?.addListener || !storage?.get || !storage?.set) return;
 
-    const KEY = '__geekez_extension_seen_once__';
+    const LEGACY_KEY = '__geekez_extension_seen_once__';
+    const VERSION_KEY = '__geekez_extension_installed_version__';
     const originalAddListener = runtime.onInstalled.addListener.bind(runtime.onInstalled);
+    const originalRemoveListener = typeof runtime.onInstalled.removeListener === 'function'
+      ? runtime.onInstalled.removeListener.bind(runtime.onInstalled)
+      : null;
+    const originalHasListener = typeof runtime.onInstalled.hasListener === 'function'
+      ? runtime.onInstalled.hasListener.bind(runtime.onInstalled)
+      : null;
+    const wrappedListeners = new WeakMap();
+    const eventDecisions = new WeakMap();
 
-    const readSeen = (callback) => {
-      try {
-        if (storage.get.length >= 2) {
-          storage.get([KEY], (result) => callback(!!(result && result[KEY])));
-          return;
-        }
-        Promise.resolve(storage.get(KEY))
-          .then((result) => callback(!!(result && result[KEY])))
-          .catch(() => callback(false));
-      } catch (e) {
-        callback(false);
-      }
+    const finishOnce = (resolve) => {
+      let finished = false;
+      return (value) => {
+        if (finished) return;
+        finished = true;
+        resolve(value);
+      };
     };
 
-    const markSeen = () => {
+    const readInstallState = () => new Promise((resolve) => {
+      const finish = finishOnce(resolve);
       try {
-        if (storage.set.length >= 2) {
-          storage.set({ [KEY]: Date.now() }, () => {});
-          return;
+        const pending = storage.get(null, (result) => finish(result || {}));
+        if (pending && typeof pending.then === 'function') {
+          pending.then((result) => finish(result || {})).catch(() => finish({}));
         }
-        storage.set({ [KEY]: Date.now() });
-      } catch (e) {}
+      } catch (e) {
+        try {
+          Promise.resolve(storage.get(null))
+            .then((result) => finish(result || {}))
+            .catch(() => finish({}));
+        } catch (inner) {
+          finish({});
+        }
+      }
+    });
+
+    const writeInstallState = (version) => new Promise((resolve) => {
+      const finish = finishOnce(resolve);
+      const values = {
+        [LEGACY_KEY]: true,
+        [VERSION_KEY]: String(version || '')
+      };
+      try {
+        const pending = storage.set(values, () => finish());
+        if (pending && typeof pending.then === 'function') {
+          pending.then(() => finish()).catch(() => finish());
+        }
+      } catch (e) {
+        try {
+          Promise.resolve(storage.set(values)).then(() => finish()).catch(() => finish());
+        } catch (inner) {
+          finish();
+        }
+      }
+    });
+
+    const installStateAtStartup = (async () => {
+      const state = await readInstallState();
+      const currentVersion = String(runtime.getManifest?.().version || '');
+      const storedVersion = String(state && state[VERSION_KEY] || '');
+      const legacySeen = !!(state && state[LEGACY_KEY]);
+      const hasExistingState = Object.keys(state || {}).some((key) => {
+        return key !== LEGACY_KEY && key !== VERSION_KEY;
+      });
+
+      if (storedVersion !== currentVersion || !legacySeen) {
+        await writeInstallState(currentVersion);
+      }
+
+      return { currentVersion, storedVersion, legacySeen, hasExistingState };
+    })().catch(() => null);
+
+    const decideInstallEvent = (details) => {
+      if (!details || typeof details !== 'object') {
+        return Promise.resolve({ emit: true, details });
+      }
+      if (eventDecisions.has(details)) return eventDecisions.get(details);
+
+      const decision = (async () => {
+        const repeatedLifecycleEvent = details.reason === 'install' || details.reason === 'update';
+
+        if (!repeatedLifecycleEvent) {
+          return { emit: true, details };
+        }
+
+        const startupState = await installStateAtStartup;
+        if (!startupState) {
+          return { emit: true, details };
+        }
+
+        const { currentVersion, storedVersion, legacySeen, hasExistingState } = startupState;
+
+        if (storedVersion) {
+          if (storedVersion === currentVersion) {
+            return { emit: false, details };
+          }
+          if (storedVersion !== currentVersion) {
+            return {
+              emit: true,
+              details: Object.assign({}, details, {
+                reason: 'update',
+                previousVersion: storedVersion
+              })
+            };
+          }
+          return { emit: true, details };
+        }
+
+        if (legacySeen || hasExistingState) {
+          return { emit: false, details };
+        }
+        return { emit: true, details };
+      })().catch(() => ({ emit: true, details }));
+
+      eventDecisions.set(details, decision);
+      return decision;
     };
 
     runtime.onInstalled.addListener = (listener) => {
       if (typeof listener !== 'function') {
         return originalAddListener(listener);
       }
+      if (wrappedListeners.has(listener)) {
+        return originalAddListener(wrappedListeners.get(listener));
+      }
 
       const wrapped = (details) => {
-        const originalDetails = details;
-        const emit = (payload) => {
-          try {
-            listener(payload);
-          } catch (e) {
-            try { listener(originalDetails); } catch (inner) {}
-          }
-        };
-
-        readSeen((seen) => {
-          if (!seen) {
-            markSeen();
-            emit(originalDetails);
-            return;
-          }
-
-          if (originalDetails && originalDetails.reason === 'install') {
-            const mapped = Object.assign({}, originalDetails, { reason: 'update' });
-            if (!mapped.previousVersion) {
-              try {
-                mapped.previousVersion = runtime.getManifest?.().version || '';
-              } catch (e) {}
-            }
-            emit(mapped);
-            return;
-          }
-
-          emit(originalDetails);
+        decideInstallEvent(details).then((decision) => {
+          if (!decision || !decision.emit) return;
+          try { listener(decision.details); } catch (e) {}
         });
       };
 
+      wrappedListeners.set(listener, wrapped);
       return originalAddListener(wrapped);
     };
+
+    if (originalRemoveListener) {
+      runtime.onInstalled.removeListener = (listener) => {
+        const wrapped = wrappedListeners.get(listener) || listener;
+        wrappedListeners.delete(listener);
+        return originalRemoveListener(wrapped);
+      };
+    }
+
+    if (originalHasListener) {
+      runtime.onInstalled.hasListener = (listener) => {
+        return originalHasListener(wrappedListeners.get(listener) || listener);
+      };
+    }
   } catch (e) {}
 })();
 `;
 
     if (isModuleType) {
-        return `${shim}\nimport '${importTarget}';\n`;
+        const moduleShimSource = `/* __geekez_oninstalled_shim_runtime__ */\n${shim}`;
+        const moduleShimDigest = crypto.createHash('sha256')
+            .update(moduleShimSource)
+            .digest('hex')
+            .slice(0, 12);
+        const shimRelPath = path.posix.join(
+            path.posix.dirname(toManifestPath(wrapperRelPath)),
+            `__geekez_sw_install_shim_${moduleShimDigest}.js`
+        );
+        const shimImportTarget = toRelativeWorkerPath(wrapperRelPath, shimRelPath)
+            .replace(/\\/g, '/')
+            .replace(/'/g, "\\'");
+        return {
+            wrapperSource: `/* __geekez_oninstalled_shim__ */\n/* __geekez_original_worker__:${originalWorkerRelPath} */\nimport '${shimImportTarget}';\nimport '${importTarget}';\n`,
+            moduleShim: {
+                relPath: shimRelPath,
+                source: moduleShimSource
+            }
+        };
     }
-    return `${shim}\ntry { importScripts('${importTarget}'); } catch (e) {}\n`;
+    return {
+        wrapperSource: `/* __geekez_oninstalled_shim__ */\n/* __geekez_original_worker__:${originalWorkerRelPath} */\n${shim}\ntry { importScripts('${importTarget}'); } catch (e) {}\n`,
+        moduleShim: null
+    };
 }
 
 async function patchExtensionInstallBehavior(extensionDir) {
@@ -1024,14 +1262,14 @@ async function patchExtensionInstallBehavior(extensionDir) {
     const currentServiceWorker = toManifestPath(bg.service_worker || '');
     if (!currentServiceWorker) return false;
 
-    const bootstrapPattern = /(^|\/)__geekez_sw_bootstrap__\.js$/;
+    const bootstrapPattern = /(^|\/)__geekez_sw_bootstrap(?:__|_[a-f0-9]{12})\.js$/;
     const isBootstrapWorker = bootstrapPattern.test(currentServiceWorker);
-    const wrapperRelPath = isBootstrapWorker
+    let wrapperRelPath = isBootstrapWorker
         ? currentServiceWorker
         : (path.posix.dirname(currentServiceWorker) === '.'
             ? '__geekez_sw_bootstrap__.js'
             : `${path.posix.dirname(currentServiceWorker)}/__geekez_sw_bootstrap__.js`);
-    const wrapperAbsPath = path.join(extensionDir, ...wrapperRelPath.split('/'));
+    let wrapperAbsPath = path.join(extensionDir, ...wrapperRelPath.split('/'));
 
     let workerRelPath = currentServiceWorker;
     if (isBootstrapWorker && fs.existsSync(wrapperAbsPath)) {
@@ -1059,9 +1297,41 @@ async function patchExtensionInstallBehavior(extensionDir) {
     if (!fs.existsSync(workerAbsPath)) return false;
 
     const isModuleType = String(bg.type || '').toLowerCase() === 'module';
-    const wrapperSource = buildExtensionInstallShimSource(wrapperRelPath, workerRelPath, isModuleType);
+    let { wrapperSource, moduleShim } = buildExtensionInstallShimSource(
+        wrapperRelPath,
+        workerRelPath,
+        isModuleType
+    );
+    const wrapperDigest = crypto.createHash('sha256')
+        .update(wrapperSource)
+        .digest('hex')
+        .slice(0, 12);
+    const hashedWrapperRelPath = path.posix.join(
+        path.posix.dirname(wrapperRelPath),
+        `__geekez_sw_bootstrap_${wrapperDigest}.js`
+    );
+    if (hashedWrapperRelPath !== wrapperRelPath) {
+        wrapperRelPath = hashedWrapperRelPath;
+        wrapperAbsPath = path.join(extensionDir, ...wrapperRelPath.split('/'));
+        ({ wrapperSource, moduleShim } = buildExtensionInstallShimSource(
+            wrapperRelPath,
+            workerRelPath,
+            isModuleType
+        ));
+    }
 
     let changed = false;
+    if (moduleShim) {
+        const moduleShimAbsPath = path.join(extensionDir, ...moduleShim.relPath.split('/'));
+        const currentModuleShimSource = fs.existsSync(moduleShimAbsPath)
+            ? await fs.readFile(moduleShimAbsPath, 'utf8').catch(() => '')
+            : '';
+        if (currentModuleShimSource !== moduleShim.source) {
+            await fs.outputFile(moduleShimAbsPath, moduleShim.source, 'utf8');
+            changed = true;
+        }
+    }
+
     let currentWrapperSource = '';
     if (fs.existsSync(wrapperAbsPath)) {
         currentWrapperSource = await fs.readFile(wrapperAbsPath, 'utf8').catch(() => '');
@@ -1083,67 +1353,6 @@ async function patchExtensionInstallBehavior(extensionDir) {
     return changed;
 }
 
-async function patchKnownExtensionOnboarding(extensionDir, storeId = '') {
-    const id = String(storeId || '').toLowerCase();
-    if (!['bpoadfkcbjbfhfodiogcnhhhpibjhbnh', 'amkbmndfnliijdhojkpoglbnaaahippg'].includes(id)) {
-        return false;
-    }
-
-    const jsFiles = [];
-    const walk = async (dir) => {
-        const entries = await fs.readdir(dir, { withFileTypes: true }).catch(() => []);
-        for (const entry of entries) {
-            const full = path.join(dir, entry.name);
-            if (entry.isDirectory()) {
-                await walk(full);
-                continue;
-            }
-            if (entry.isFile() && /\.(js|mjs|cjs)$/i.test(entry.name)) {
-                jsFiles.push(full);
-            }
-        }
-    };
-    await walk(extensionDir);
-
-    let changed = false;
-    for (const filePath of jsFiles) {
-        let content;
-        try {
-            content = await fs.readFile(filePath, 'utf8');
-        } catch (e) {
-            continue;
-        }
-        if (!/onboarding|GUIDE_BASE|onboardingDisplayTime/i.test(content)) continue;
-
-        let next = content;
-        // Immersive Translate unpacked extension may fire onInstalled on every launch.
-        // Force onboarding link creation to run only once when onboardingDisplayTime is empty.
-        next = next.replace(
-            /([a-zA-Z_$][\w$]*)\?([a-zA-Z_$][\w$]*)\|\|\(await _e\("onboardingDisplayTime",new Date\(\)\.toISOString\(\)\),([a-zA-Z_$][\w$]*\.tabs\.create\(\{url:[a-zA-Z_$][\w$]*\.toString\(\)\}\))\):([a-zA-Z_$][\w$]*\.tabs\.create\(\{url:[a-zA-Z_$][\w$]*\.toString\(\)\}\))/g,
-            (_m, _platformFlag, onboardingFlag, createOnceExpr) => `${onboardingFlag}||(await _e("onboardingDisplayTime",new Date().toISOString()),${createOnceExpr})`
-        );
-        next = next.replace(
-            'a?o||(await _e("onboardingDisplayTime",new Date().toISOString()),w.tabs.create({url:s.toString()})):w.tabs.create({url:s.toString()})',
-            'o||(await _e("onboardingDisplayTime",new Date().toISOString()),w.tabs.create({url:s.toString()}))'
-        );
-        next = next.replace(
-            /(?:chrome|browser)\.tabs\.create\(\s*\{[\s\S]{0,260}?onboarding\.immersivetranslate\.com[\s\S]{0,260}?\}\s*\)\s*;?/g,
-            'Promise.resolve()'
-        );
-        next = next.replace(
-            /(?:chrome|browser)\.tabs\.create\(\s*\{[\s\S]{0,260}?(?:\?t=i&v=|onboarding\\?\.immersivetranslate\\?\.com)[\s\S]{0,260}?\}\s*\)\s*;?/g,
-            'Promise.resolve()'
-        );
-
-        if (next !== content) {
-            await fs.writeFile(filePath, next);
-            changed = true;
-        }
-    }
-
-    return changed;
-}
-
 function buildChromeStoreCrxUrl(extensionId) {
     return `https://clients2.google.com/service/update2/crx?response=redirect&prodversion=147.0.0.0&acceptformat=crx2,crx3&x=id%3D${extensionId}%26installsource%3Dondemand%26uc`;
 }
@@ -1160,22 +1369,355 @@ async function saveSettingsWithNormalizedExtensions(settings) {
     return nextSettings;
 }
 
+async function saveExtensionSettings(extensions) {
+    return runProfileApiTask(async () => {
+        const latest = await readSettingsForExtensionMutation();
+        return saveSettingsWithNormalizedExtensions({ ...latest, userExtensions: extensions });
+    });
+}
+
 function normalizeSettingsSnapshot(settings) {
     const nextSettings = settings || {};
     if (!Array.isArray(nextSettings.preProxies)) nextSettings.preProxies = [];
     if (!Array.isArray(nextSettings.subscriptions)) nextSettings.subscriptions = [];
     if (!['single', 'balance', 'failover'].includes(nextSettings.mode)) nextSettings.mode = 'single';
-    nextSettings.lang = nextSettings.lang === 'en' ? 'en' : 'cn';
+    nextSettings.lang = ['cn', 'en', 'auto'].includes(nextSettings.lang) ? nextSettings.lang : 'auto';
     nextSettings.enablePreProxy = !!nextSettings.enablePreProxy;
     nextSettings.notify = !!nextSettings.notify;
     nextSettings.userExtensions = normalizeUserExtensions(nextSettings.userExtensions || []);
     nextSettings.closeBehavior = normalizeCloseBehavior(nextSettings.closeBehavior);
+    nextSettings.defaultBookmarks = normalizeDefaultBookmarks(nextSettings.defaultBookmarks);
+    nextSettings.defaultBookmarkScope = normalizeTagScope(nextSettings.defaultBookmarkScope);
+    nextSettings.defaultPasswordScope = normalizeTagScope(nextSettings.defaultPasswordScope);
+    delete nextSettings.defaultPasswords;
     return nextSettings;
+}
+
+function normalizeTagScope(rawScope) {
+    const scope = rawScope && typeof rawScope === 'object' ? rawScope : {};
+    const mode = ['all', 'includeTags', 'excludeTags'].includes(scope.mode) ? scope.mode : 'all';
+    const tags = Array.from(new Set(
+        (Array.isArray(scope.tags) ? scope.tags : [])
+            .map(tag => String(tag || '').trim())
+            .filter(Boolean)
+    ));
+    return { mode, tags };
+}
+
+function normalizeDefaultBookmarks(rawBookmarks) {
+    if (!Array.isArray(rawBookmarks)) return [];
+    return rawBookmarks.map((item) => {
+        if (!item || typeof item !== 'object') return null;
+        const url = String(item.url || '').trim();
+        let parsedUrl;
+        try {
+            parsedUrl = new URL(url);
+        } catch (error) {
+            return null;
+        }
+        if (!['http:', 'https:'].includes(parsedUrl.protocol)) return null;
+        const name = String(item.name || '').trim() || parsedUrl.hostname;
+        return {
+            id: String(item.id || uuidv4()),
+            name,
+            url
+        };
+    }).filter(Boolean);
+}
+
+function normalizeDefaultPasswords(rawPasswords) {
+    if (!Array.isArray(rawPasswords)) throw new Error('内置账号列表格式无效');
+    const usedIds = new Set();
+    const accounts = new Set();
+    return rawPasswords.map((item, index) => {
+        const invalid = message => new Error(`第 ${index + 1} 个账号：${message}`);
+        if (!item || typeof item !== 'object') throw invalid('格式无效');
+        const rawUrl = String(item.url || '').trim();
+        let parsedUrl;
+        try {
+            parsedUrl = new URL(rawUrl);
+        } catch (error) {
+            throw invalid('请填写有效的网站地址');
+        }
+        if (!['http:', 'https:'].includes(parsedUrl.protocol) || parsedUrl.username || parsedUrl.password) {
+            throw invalid('请填写不含账号密码的 HTTP 或 HTTPS 网站地址');
+        }
+        const username = String(item.username || '').trim();
+        const password = String(item.password || '');
+        if (!username || !password) throw invalid('请填写用户名和密码');
+        const account = JSON.stringify([parsedUrl.origin, username]);
+        if (accounts.has(account)) throw invalid('该网站和用户名已存在');
+        accounts.add(account);
+
+        const enabled = item.twoFactorEnabled === true ||
+            (item.twoFactorEnabled !== false && Boolean(item.twoFactorSecret));
+        let twoFactorSecret = '';
+        if (enabled) {
+            try {
+                twoFactorSecret = normalizePresetTotpSecret(item.twoFactorSecret);
+            } catch (error) {
+                throw invalid(error.message);
+            }
+        }
+        const requestedId = String(item.id || '').trim();
+        const id = requestedId && !usedIds.has(requestedId) ? requestedId : uuidv4();
+        usedIds.add(id);
+        return {
+            id,
+            name: String(item.name || '').trim() || parsedUrl.hostname,
+            url: parsedUrl.href,
+            origin: parsedUrl.origin,
+            username,
+            password,
+            notes: String(item.notes || ''),
+            twoFactorEnabled: Boolean(twoFactorSecret),
+            twoFactorSecret
+        };
+    });
+}
+
+function normalizePresetTotpSecret(value) {
+    let secret = typeof value === 'string' ? value.trim() : '';
+    if (/^otpauth:/i.test(secret)) {
+        const url = new URL(secret);
+        if (url.protocol !== 'otpauth:' || url.hostname !== 'totp') throw new Error('仅支持 TOTP 配置');
+        const params = url.searchParams;
+        for (const key of ['secret', 'algorithm', 'digits', 'period']) {
+            if (params.getAll(key).length > 1) throw new Error('2FA 配置包含重复参数');
+        }
+        if ((params.has('algorithm') && params.get('algorithm').toUpperCase() !== 'SHA1') ||
+            (params.has('digits') && params.get('digits') !== '6') ||
+            (params.has('period') && params.get('period') !== '30')) {
+            throw new Error('仅支持 SHA1、6 位、30 秒的 TOTP 配置');
+        }
+        secret = params.get('secret');
+    }
+    return normalizeTotpSecret(secret);
+}
+
+async function readDefaultPasswordSettings({ strict = false } = {}) {
+    if (!fs.existsSync(DEFAULT_PASSWORDS_FILE)) return { passwords: [], scope: normalizeTagScope() };
+    try {
+        const data = await fs.readFile(DEFAULT_PASSWORDS_FILE);
+        const stored = JSON.parse(decryptData(data, 'GeekEZ_PW_defaults').toString('utf8'));
+        return {
+            passwords: normalizeDefaultPasswords(stored?.passwords),
+            scope: normalizeTagScope(stored?.scope)
+        };
+    } catch (error) {
+        if (strict) throw error;
+        console.warn('[Password Manager] Failed to read built-in accounts:', error.message);
+        return { passwords: [], scope: normalizeTagScope() };
+    }
+}
+
+async function writeDefaultPasswordSettings(passwords, scope) {
+    const normalizedPasswords = normalizeDefaultPasswords(passwords);
+    const payload = {
+        version: 1,
+        passwords: normalizedPasswords,
+        scope: normalizeTagScope(scope)
+    };
+    const encrypted = encryptData(Buffer.from(JSON.stringify(payload), 'utf8'), 'GeekEZ_PW_defaults');
+    await fs.writeFile(DEFAULT_PASSWORDS_FILE, encrypted);
+    return payload;
+}
+
+function chromiumBookmarkTimestamp() {
+    return String((Date.now() + 11644473600000) * 1000);
+}
+
+function createBookmarkRoot(id, guid, name) {
+    const timestamp = chromiumBookmarkTimestamp();
+    return {
+        children: [],
+        date_added: timestamp,
+        date_modified: timestamp,
+        guid,
+        id: String(id),
+        name,
+        type: 'folder'
+    };
+}
+
+function normalizeBookmarksDocument(rawDocument, { strict = false } = {}) {
+    if (strict) {
+        const isObject = value => value && typeof value === 'object' && !Array.isArray(value);
+        const isBookmark = node => isObject(node) && (node.type === 'folder'
+            ? Array.isArray(node.children) && node.children.every(isBookmark)
+            : node.type === 'url' && typeof node.url === 'string');
+        if (!isObject(rawDocument) || !isObject(rawDocument.roots) ||
+            !Object.values(rawDocument.roots).every(root => root?.type === 'folder' && isBookmark(root))) {
+            throw new Error('Existing bookmark file is invalid; no files were changed');
+        }
+    }
+    const document = rawDocument && typeof rawDocument === 'object' ? rawDocument : {};
+    if (!document.roots || typeof document.roots !== 'object') document.roots = {};
+    const rootDefaults = [
+        ['bookmark_bar', '1', 'bookmark_bar', 'Bookmarks bar'],
+        ['other', '2', 'other', 'Other bookmarks'],
+        ['synced', '3', 'synced', 'Mobile bookmarks']
+    ];
+    for (const [key, id, guid, name] of rootDefaults) {
+        const existing = document.roots[key];
+        document.roots[key] = existing && typeof existing === 'object'
+            ? { ...createBookmarkRoot(id, guid, name), ...existing, children: Array.isArray(existing.children) ? existing.children : [] }
+            : createBookmarkRoot(id, guid, name);
+    }
+    if (!Number.isFinite(Number(document.version))) document.version = 1;
+    return document;
+}
+
+function findLargestBookmarkId(node) {
+    if (!node || typeof node !== 'object') return 3;
+    let largest = Number.parseInt(node.id, 10);
+    if (!Number.isFinite(largest)) largest = 3;
+    for (const child of Array.isArray(node.children) ? node.children : []) {
+        largest = Math.max(largest, findLargestBookmarkId(child));
+    }
+    return largest;
+}
+
+function collectBookmarkUrls(node, result = new Set()) {
+    if (!node || typeof node !== 'object') return result;
+    if (node.type === 'url' && node.url) {
+        try { result.add(new URL(node.url).href); } catch { result.add(String(node.url).trim()); }
+    }
+    for (const child of Array.isArray(node.children) ? node.children : []) collectBookmarkUrls(child, result);
+    return result;
+}
+
+function appendProfileBookmarks(document, bookmarks) {
+    const roots = Object.values(document.roots);
+    const existingUrls = new Set();
+    roots.forEach(root => collectBookmarkUrls(root, existingUrls));
+    let nextId = Math.max(3, ...roots.map(findLargestBookmarkId));
+    let added = 0;
+    for (const bookmark of bookmarks) {
+        const url = new URL(bookmark.url).href;
+        if (existingUrls.has(url)) continue;
+        document.roots.bookmark_bar.children.push({
+            date_added: chromiumBookmarkTimestamp(),
+            guid: uuidv4(),
+            id: String(++nextId),
+            name: bookmark.name,
+            type: 'url',
+            url
+        });
+        existingUrls.add(url);
+        added++;
+    }
+    if (added) {
+        document.roots.bookmark_bar.date_modified = chromiumBookmarkTimestamp();
+        // Chromium rebuilds the checksum after the bookmark tree changes.
+        document.checksum = '';
+    }
+    return { added, skipped: bookmarks.length - added };
+}
+
+function passwordAccountKey(entry) {
+    let origin = String(entry?.origin || '').trim();
+    if (!origin && entry?.url) {
+        try { origin = new URL(entry.url).origin; } catch { }
+    }
+    return JSON.stringify([origin, String(entry?.username || '').trim()]);
+}
+
+function appendDefaultPasswords(passwords, defaults) {
+    const existingKeys = new Set(passwords.map(passwordAccountKey));
+    const usedIds = new Set(passwords.map(entry => entry.id));
+    let added = 0;
+    for (const entry of defaults) {
+        const key = passwordAccountKey(entry);
+        if (existingKeys.has(key)) continue;
+        let id = entry.id;
+        while (!id || usedIds.has(id)) id = uuidv4();
+        const now = Date.now();
+        passwords.push({ ...entry, id, createdAt: now, updatedAt: now });
+        existingKeys.add(key);
+        usedIds.add(id);
+        added++;
+    }
+    return added;
+}
+
+function matchesProfileTagScope(profile, scope) {
+    const normalizedScope = normalizeTagScope(scope);
+    if (normalizedScope.mode === 'all') return true;
+    const selectedTags = new Set(normalizedScope.tags);
+    const profileTags = normalizeTags(profile?.tags || []);
+    const hasSelectedTag = profileTags.some(tag => selectedTags.has(tag));
+    return normalizedScope.mode === 'includeTags' ? hasSelectedTag : !hasSelectedTag;
+}
+
+function shouldApplyDefaultBookmarks(profile, settings) {
+    const normalizedSettings = normalizeSettingsSnapshot(settings || {});
+    return matchesProfileTagScope(profile, normalizedSettings.defaultBookmarkScope);
+}
+
+async function applyDefaultBookmarksToProfile(profile, settings) {
+    const nextProfile = {
+        ...profile,
+        defaultBookmarksAppliedAt: Date.now()
+    };
+    const normalizedSettings = normalizeSettingsSnapshot(settings || {});
+    const defaults = normalizedSettings.defaultBookmarks;
+    if (!defaults.length || !shouldApplyDefaultBookmarks(profile, normalizedSettings)) return nextProfile;
+
+    const bookmarksPath = path.join(DATA_PATH, profile.id, 'browser_data', 'Default', 'Bookmarks');
+    try {
+        await fs.ensureDir(path.dirname(bookmarksPath));
+        let document = {};
+        if (fs.existsSync(bookmarksPath)) {
+            document = await fs.readJson(bookmarksPath).catch(() => ({}));
+        }
+        document = normalizeBookmarksDocument(document);
+        appendProfileBookmarks(document, defaults);
+        await fs.writeJson(bookmarksPath, document, { spaces: 2 });
+    } catch (error) {
+        console.warn(`[Bookmarks] Failed to initialize defaults for ${profile.id}:`, error.message);
+    }
+    return nextProfile;
+}
+
+async function applyDefaultPasswordsToProfile(profile, settings) {
+    const nextProfile = {
+        ...profile,
+        defaultPasswordsAppliedAt: Date.now()
+    };
+    const hasStoredScope = Object.prototype.hasOwnProperty.call(settings || {}, 'defaultPasswordScope');
+    const normalizedSettings = normalizeSettingsSnapshot(settings || {});
+    const configured = await readDefaultPasswordSettings();
+    const defaults = configured.passwords;
+    const scope = hasStoredScope
+        ? normalizedSettings.defaultPasswordScope
+        : configured.scope;
+    if (!defaults.length || !matchesProfileTagScope(profile, scope)) return nextProfile;
+
+    const pwFile = path.join(DATA_PATH, profile.id, 'passwords.json');
+    try {
+        await fs.ensureDir(path.dirname(pwFile));
+        const existing = await readEncryptedPasswords(pwFile, profile.id);
+        const passwords = Array.isArray(existing) ? existing.slice() : [];
+        const added = appendDefaultPasswords(passwords, defaults);
+        if (added || !fs.existsSync(pwFile)) await writeEncryptedPasswords(pwFile, passwords, profile.id);
+    } catch (error) {
+        console.warn(`[Password Manager] Failed to initialize defaults for ${profile.id}:`, error.message);
+    }
+    return nextProfile;
 }
 
 function isDirectProxy(proxyStr) {
     const value = String(proxyStr || '').trim().toLowerCase();
     return value === 'direct' || value === 'direct://';
+}
+
+function isNoOverrideValue(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    return normalized === 'none' ||
+        normalized === 'do not modify' ||
+        normalized === 'do not modify (browser default)' ||
+        normalized === 'no change (browser default)';
 }
 
 function isAutoTimezoneValue(value) {
@@ -1210,7 +1752,7 @@ function isAutoLanguageValue(value) {
 
 function canonicalizeLocale(value) {
     const raw = String(value || '').trim();
-    if (!raw || isAutoLanguageValue(raw)) return '';
+    if (!raw || isAutoLanguageValue(raw) || isNoOverrideValue(raw)) return '';
     try {
         const locales = Intl.getCanonicalLocales(raw);
         return locales[0] || '';
@@ -1256,7 +1798,8 @@ function buildRuntimeLanguageState(fingerprint = {}) {
             enabled: false,
             language: '',
             languages: [],
-            acceptLanguageHeader: ''
+            acceptLanguageHeader: '',
+            acceptLanguageOverride: ''
         };
     }
 
@@ -1265,7 +1808,9 @@ function buildRuntimeLanguageState(fingerprint = {}) {
         enabled: true,
         language,
         languages,
-        acceptLanguageHeader: buildAcceptLanguageHeader(language, languages)
+        acceptLanguageHeader: buildAcceptLanguageHeader(language, languages),
+        // CDP expects a comma-separated locale list, not an HTTP header with q-values.
+        acceptLanguageOverride: languages.join(',')
     };
 }
 
@@ -1285,6 +1830,7 @@ function getProfileRuntimeLanguageState(profileId) {
         language: '',
         languages: [],
         acceptLanguageHeader: '',
+        acceptLanguageOverride: '',
         updatedAt: 0
     };
 }
@@ -1520,7 +2066,7 @@ function buildAutoIpBaseFingerprint(baseFingerprint = {}, source, policy) {
     return nextFingerprint;
 }
 
-async function resolveAutoIpBaseFingerprintAfterLaunch(profileId, baseFingerprint, localPort) {
+async function resolveAutoIpBaseFingerprint(profileId, baseFingerprint, localPort) {
     const policy = getAutoIpBasePolicy(baseFingerprint);
     if (!policy.enabled) return null;
 
@@ -1544,6 +2090,70 @@ async function resolveAutoIpBaseFingerprintAfterLaunch(profileId, baseFingerprin
         policy,
         cacheHit: !!cacheMatchesCurrentIp
     };
+}
+
+function logAutoIpBaseResolution(profileName, profileId, resolved) {
+    if (!resolved || !resolved.fingerprint || !resolved.source || !resolved.policy) return;
+
+    const runtimeFingerprint = resolved.fingerprint;
+    const parts = [];
+    if (resolved.policy.location && hasValidGeolocation(runtimeFingerprint.geolocation)) {
+        parts.push(`geo=${runtimeFingerprint.geolocation.latitude},${runtimeFingerprint.geolocation.longitude}`);
+    }
+    if (resolved.policy.timezone && isValidTimezoneId(runtimeFingerprint.timezone)) {
+        parts.push(`timezone=${runtimeFingerprint.timezone}`);
+    }
+    if (resolved.policy.language && canonicalizeLocale(runtimeFingerprint.language)) {
+        parts.push(`language=${runtimeFingerprint.language}`);
+    }
+    console.log(`[Auto IP Base] ${profileName || profileId}: ${resolved.cacheHit ? 'reused cache' : 'refreshed'} ip=${resolved.source.ip}${parts.length ? ` ${parts.join(' ')}` : ''}`);
+}
+
+function isGoogleAuthLikeUrl(rawUrl) {
+    const value = String(rawUrl || '').trim();
+    if (!value) return false;
+
+    try {
+        const parsed = new URL(value);
+        const host = String(parsed.hostname || '').toLowerCase();
+        const pathname = String(parsed.pathname || '').toLowerCase();
+        if (host === 'accounts.google.com' || host.endsWith('.accounts.google.com')) return true;
+        if (host === 'accounts.youtube.com' || host.endsWith('.accounts.youtube.com')) return true;
+        if ((host === 'google.com' || host === 'www.google.com') && pathname.startsWith('/recaptcha/')) return true;
+    } catch (e) { }
+
+    return false;
+}
+
+function isPreNavigationUrl(rawUrl) {
+    const value = String(rawUrl || '').trim().toLowerCase();
+    return !value ||
+        value === 'about:blank' ||
+        value === 'chrome://newtab/' ||
+        value === 'chrome://new-tab-page/';
+}
+
+function normalizeProxyStr(proxyStr) {
+    const raw = String(proxyStr || '').trim();
+    if (!raw || isDirectProxy(raw)) return raw;
+
+    // 如果已经有协议前缀，直接返回
+    if (raw.includes('://')) return raw;
+
+    // 处理简写的 SOCKS 格式：IP:Port 或 IP:Port:User:Pass
+    if (raw.includes(':') && !raw.includes('://')) {
+        const parts = raw.split(':');
+        // IP:Port 格式
+        if (parts.length === 2) {
+            return `socks5://${parts[0]}:${parts[1]}`;
+        }
+        // IP:Port:User:Pass 格式
+        if (parts.length === 4) {
+            return `socks5://${parts[2]}:${parts[3]}@${parts[0]}:${parts[1]}`;
+        }
+    }
+
+    return raw;
 }
 
 function ensureProxyStrValid(proxyStr) {
@@ -1665,9 +2275,11 @@ function normalizeFingerprintOptions(data = {}) {
     );
 
     const rawLanguage = firstDefined(data.language, inputFp.language);
-    const normalizedLanguage = isAutoLanguageValue(rawLanguage)
-        ? 'auto'
-        : (canonicalizeLocale(rawLanguage) || rawLanguage);
+    const normalizedLanguage = isNoOverrideValue(rawLanguage)
+        ? 'none'
+        : (isAutoLanguageValue(rawLanguage)
+            ? 'auto'
+            : (canonicalizeLocale(rawLanguage) || rawLanguage));
 
     const normalized = {
         ...inputFp,
@@ -1676,7 +2288,9 @@ function normalizeFingerprintOptions(data = {}) {
         city: firstDefined(data.city, inputFp.city),
         geolocation: firstDefined(data.geolocation, inputFp.geolocation),
         language: normalizedLanguage,
-        languages: normalizedLanguage === 'auto' ? [] : firstDefined(data.languages, inputFp.languages),
+        languages: normalizedLanguage === 'auto' || normalizedLanguage === 'none'
+            ? []
+            : firstDefined(data.languages, inputFp.languages),
         platform: firstDefined(data.platform, inputFp.platform),
         hardwareConcurrency: firstDefined(data.hardwareConcurrency, inputFp.hardwareConcurrency),
         deviceMemory: firstDefined(data.deviceMemory, inputFp.deviceMemory),
@@ -1753,10 +2367,12 @@ async function buildProfileFromInput(rawData, profiles, settings, existingProfil
     const uniqueName = existingProfile && baseName === existingProfile.name
         ? existingProfile.name
         : buildUniqueProfileName(profiles, baseName);
-    const proxyStr = firstDefined(data.proxyStr, existingProfile?.proxyStr, '') || '';
+    let proxyStr = firstDefined(data.proxyStr, existingProfile?.proxyStr, '') || '';
     const proxyChanged = !existingProfile || (hasOwn(data, 'proxyStr') && proxyStr !== (existingProfile?.proxyStr || ''));
     if (proxyChanged) {
         ensureProxyStrValid(proxyStr);
+        // 标准化代理字符串，将简写格式转换为标准格式
+        proxyStr = normalizeProxyStr(proxyStr);
     }
 
     const incomingFingerprint = data.fingerprint && typeof data.fingerprint === 'object' ? data.fingerprint : {};
@@ -1900,9 +2516,189 @@ function resolveApiExportProfiles(profiles, params, routeSelector = '') {
     return { profiles: selected, selectedAll: false };
 }
 
-// --- Chrome 密码解密辅助函数 ---
-// 解密 Chrome 主密钥 (平台相关)
+function profileResourceError(message, status = 400) {
+    return Object.assign(new Error(message), { status });
+}
+
+function normalizeApiProfileResources(data) {
+    if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        throw profileResourceError('Request body must be a JSON object');
+    }
+    const resources = { passwords: [], bookmarks: [] };
+    const accounts = new Set();
+    for (const field of ['passwords', 'bookmarks']) {
+        if (!hasOwn(data, field)) continue;
+        if (!Array.isArray(data[field])) throw profileResourceError(`${field} must be an array`);
+        resources[field] = data[field].map((item, index) => {
+            const invalid = message => profileResourceError(`${field}[${index}]: ${message}`);
+            if (!item || typeof item !== 'object' || Array.isArray(item)) throw invalid('must be an object');
+            let url;
+            try { url = new URL(typeof item.url === 'string' ? item.url.trim() : ''); }
+            catch { throw invalid('url must be a valid HTTP or HTTPS URL'); }
+            if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password) {
+                throw invalid('url must use HTTP or HTTPS without embedded credentials');
+            }
+            if (hasOwn(item, 'name') && typeof item.name !== 'string') throw invalid('name must be a string');
+            if (field === 'bookmarks') return { name: item.name?.trim() || url.hostname, url: url.href };
+            if (typeof item.username !== 'string' || !item.username.trim()) throw invalid('username is required');
+            const patch = { url: url.href, origin: url.origin, username: item.username.trim() };
+            for (const key of ['name', 'password', 'notes', 'twoFactorSecret']) {
+                if (!hasOwn(item, key)) continue;
+                if (typeof item[key] !== 'string') throw invalid(`${key} must be a string`);
+                patch[key] = item[key];
+            }
+            if (hasOwn(item, 'twoFactorEnabled') && typeof item.twoFactorEnabled !== 'boolean') {
+                throw invalid('twoFactorEnabled must be a boolean');
+            }
+            if (hasOwn(item, 'twoFactorEnabled') || hasOwn(item, 'twoFactorSecret')) {
+                patch.twoFactorEnabled = item.twoFactorEnabled ?? Boolean(item.twoFactorSecret?.trim());
+                if (!patch.twoFactorEnabled) patch.twoFactorSecret = '';
+                else if (hasOwn(item, 'twoFactorSecret')) {
+                    try { patch.twoFactorSecret = normalizePresetTotpSecret(item.twoFactorSecret); }
+                    catch (error) { throw invalid(error.message); }
+                }
+            }
+            const key = passwordAccountKey(patch);
+            if (accounts.has(key)) throw invalid('duplicate website origin and username');
+            accounts.add(key);
+            return patch;
+        });
+    }
+    return resources;
+}
+
+function upsertApiPasswords(passwords, patches) {
+    const result = { added: 0, updated: 0, unchanged: 0 };
+    patches.forEach((patch, index) => {
+        const key = passwordAccountKey(patch);
+        const at = passwords.findIndex(entry => passwordAccountKey(entry) === key);
+        const previous = at < 0 ? null : passwords[at];
+        let normalized;
+        try { [normalized] = normalizeDefaultPasswords([{ ...previous, ...patch }]); }
+        catch (error) { throw profileResourceError(`passwords[${index}]: ${error.message}`); }
+        if (previous && Object.keys(normalized).every(field => normalized[field] === previous[field])) {
+            result.unchanged++;
+            return;
+        }
+        const now = Date.now();
+        const entry = {
+            ...previous, ...normalized,
+            createdAt: previous?.createdAt || now,
+            updatedAt: now,
+            // Retain pending fields when several API updates precede the next launch.
+            apiUpdate: {
+                revision: uuidv4(),
+                fields: Array.from(new Set([...(previous?.apiUpdate?.fields || []), ...Object.keys(patch)]))
+            }
+        };
+        if (at < 0) { passwords.push(entry); result.added++; }
+        else { passwords[at] = entry; result.updated++; }
+    });
+    return result;
+}
+
+async function prepareApiProfileResources(profile, resources, settings, isNew) {
+    const files = [];
+    const results = {};
+    const defaults = isNew ? normalizeSettingsSnapshot({ ...settings }) : null;
+    const defaultPasswordSettings = isNew ? await readDefaultPasswordSettings() : null;
+    const defaultPasswords = isNew && matchesProfileTagScope(profile,
+        hasOwn(settings, 'defaultPasswordScope') ? defaults.defaultPasswordScope : defaultPasswordSettings.scope)
+        ? defaultPasswordSettings.passwords : [];
+    const defaultBookmarks = isNew && matchesProfileTagScope(profile, defaults.defaultBookmarkScope)
+        ? defaults.defaultBookmarks : [];
+
+    if (resources.passwords.length || defaultPasswords.length) {
+        const file = path.join(DATA_PATH, profile.id, 'passwords.json');
+        const passwords = await readEncryptedPasswords(file, profile.id, { strict: true });
+        const seeded = appendDefaultPasswords(passwords, defaultPasswords);
+        const result = upsertApiPasswords(passwords, resources.passwords);
+        if (resources.passwords.length) results.passwords = result;
+        if (seeded || result.added || result.updated) {
+            files.push({ file, data: encryptData(Buffer.from(JSON.stringify(passwords)), 'GeekEZ_PW_' + profile.id) });
+        }
+    }
+    if (resources.bookmarks.length || defaultBookmarks.length) {
+        const file = path.join(DATA_PATH, profile.id, 'browser_data', 'Default', 'Bookmarks');
+        const document = fs.existsSync(file)
+            ? normalizeBookmarksDocument(await fs.readJson(file), { strict: true })
+            : normalizeBookmarksDocument({});
+        const result = appendProfileBookmarks(document, resources.bookmarks);
+        const seeded = appendProfileBookmarks(document, defaultBookmarks);
+        if (resources.bookmarks.length) results.bookmarks = result;
+        if (seeded.added || result.added) files.push({ file, data: Buffer.from(JSON.stringify(document, null, 2)) });
+    }
+    return { files, results };
+}
+
+async function commitProfileFiles(files) {
+    const staged = [];
+    const committed = [];
+    try {
+        // Prepare every file before replacing any existing data; restore on I/O failure.
+        for (const entry of files) {
+            const original = fs.existsSync(entry.file) ? await fs.readFile(entry.file) : null;
+            const temporary = `${entry.file}.${uuidv4()}.tmp`;
+            staged.push({ ...entry, original, temporary });
+            await fs.ensureDir(path.dirname(entry.file));
+            await fs.writeFile(temporary, entry.data, { mode: 0o600 });
+        }
+        for (const entry of staged) {
+            await fs.rename(entry.temporary, entry.file);
+            committed.push(entry);
+        }
+    } catch (error) {
+        for (const entry of committed.reverse()) {
+            if (entry.original === null) await fs.remove(entry.file);
+            else await fs.writeFile(entry.file, entry.original);
+        }
+        throw error;
+    } finally {
+        for (const entry of staged) await fs.remove(entry.temporary);
+    }
+}
+
+async function saveApiProfile(body, idOrName = null) {
+    const data = parseApiBody(body);
+    const resources = normalizeApiProfileResources(data);
+    const profiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
+    const settings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : {};
+    const at = idOrName === null ? -1 : profiles.findIndex(p => p.id === idOrName || p.name === idOrName);
+    if (idOrName !== null && at < 0) throw profileResourceError('Profile not found', 404);
+    const previous = profiles[at] || null;
+    const hasResources = resources.passwords.length > 0 || resources.bookmarks.length > 0;
+    if (previous && hasResources && (activeProcesses[previous.id] || launchingProfiles.has(previous.id))) {
+        throw profileResourceError('Stop the profile before updating passwords or bookmarks', 409);
+    }
+    if (previous && hasResources) profileResourceWrites.add(previous.id);
+    try {
+        const profile = await buildProfileFromInput(data, profiles.filter(p => p !== previous), settings, previous);
+        const { files, results } = await prepareApiProfileResources(profile, resources, settings, !previous);
+        if (!previous) {
+            profile.defaultBookmarksAppliedAt = profile.defaultPasswordsAppliedAt = Date.now();
+            profiles.push(profile);
+        } else profiles[at] = profile;
+        files.push({ file: PROFILES_FILE, data: Buffer.from(JSON.stringify(profiles)) });
+        await commitProfileFiles(files);
+        notifyUIRefresh();
+        return { success: true, profile, remoteDebugPort: settings.enableRemoteDebugging ? profile.debugPort : null, ...results };
+    } finally {
+        if (previous && hasResources) profileResourceWrites.delete(previous.id);
+    }
+}
+
 async function handleApiRequest(method, pathname, body, params, context = {}) {
+    const profileMatch = pathname.match(/^\/api\/profiles\/([^\/]+)$/);
+    const exportPath = /^\/api\/export(?:\/|$)/.test(pathname);
+    if (((method === 'DELETE' && profileMatch) || (method === 'POST' && (pathname === '/api/import' || exportPath))) && !context.serialized) {
+        return runProfileApiTask(() => handleApiRequest(method, pathname, body, params, { ...context, serialized: true }));
+    }
+    if (method === 'POST' && pathname === '/api/profiles') {
+        return runProfileApiTask(() => saveApiProfile(body));
+    }
+    if (method === 'PUT' && profileMatch) {
+        return runProfileApiTask(() => saveApiProfile(body, decodeURIComponent(profileMatch[1])));
+    }
     let profiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
     const settings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : {};
 
@@ -1937,42 +2733,10 @@ async function handleApiRequest(method, pathname, body, params, context = {}) {
     }
 
     // GET /api/profiles/:idOrName
-    const profileMatch = pathname.match(/^\/api\/profiles\/([^\/]+)$/);
     if (method === 'GET' && profileMatch) {
         const profile = findProfile(decodeURIComponent(profileMatch[1]));
         if (!profile) return { status: 404, data: { success: false, error: 'Profile not found' } };
         return { success: true, profile: { ...profile, running: !!activeProcesses[profile.id] } };
-    }
-
-    // POST /api/profiles - Create with unique name
-    if (method === 'POST' && pathname === '/api/profiles') {
-        const data = parseApiBody(body);
-        const newProfile = await buildProfileFromInput(data, profiles, settings);
-        profiles.push(newProfile);
-        await fs.writeJson(PROFILES_FILE, profiles);
-        notifyUIRefresh(); // Notify UI to refresh
-        return {
-            success: true,
-            profile: newProfile,
-            remoteDebugPort: settings.enableRemoteDebugging ? newProfile.debugPort : null
-        };
-    }
-
-    // PUT /api/profiles/:idOrName - Edit
-    if (method === 'PUT' && profileMatch) {
-        const profile = findProfile(decodeURIComponent(profileMatch[1]));
-        if (!profile) return { status: 404, data: { success: false, error: 'Profile not found' } };
-        const idx = profiles.findIndex(p => p.id === profile.id);
-        const data = parseApiBody(body);
-        const otherProfiles = profiles.filter(p => p.id !== profile.id);
-        profiles[idx] = await buildProfileFromInput(data, otherProfiles, settings, profile);
-        await fs.writeJson(PROFILES_FILE, profiles);
-        notifyUIRefresh();
-        return {
-            success: true,
-            profile: profiles[idx],
-            remoteDebugPort: settings.enableRemoteDebugging ? profiles[idx].debugPort : null
-        };
     }
 
     // DELETE /api/profiles/:idOrName
@@ -2058,19 +2822,44 @@ async function handleApiRequest(method, pathname, body, params, context = {}) {
 
 
 
-    // GET /api/export/all?password=xxx - Export full backup (v2)
-    // GET /api/export/profile/:idOrName?password=xxx - Export one profile backup
+    // POST /api/export/all - Export full backup (v2), with an explicit export grant.
+    // POST /api/export/profile/:idOrName - Export one profile backup.
     const exportFullMatch = pathname.match(/^\/api\/export\/(all|profile)(?:\/([^\/]+))?$/);
-    if (method === 'GET' && exportFullMatch) {
+    if (exportFullMatch) {
+        if (!context.exportAuthorized) return { status: 403, data: { success: false, error: 'Forbidden' } };
+        if (method !== 'POST') return { status: 405, data: { success: false, error: 'Use POST for sensitive exports' } };
+        let exportRequest;
+        try {
+            exportRequest = JSON.parse(body || '{}');
+        } catch {
+            return { status: 400, data: { success: false, error: 'Request body must be valid JSON' } };
+        }
+        if (!exportRequest || typeof exportRequest !== 'object' || Array.isArray(exportRequest)) {
+            return { status: 400, data: { success: false, error: 'Request body must be a JSON object' } };
+        }
+        if (params.has('password')) {
+            return { status: 400, data: { success: false, error: 'Password must be sent in the request body' } };
+        }
+        const exportParams = new URLSearchParams(params);
+        for (const key of ['id', 'ids', 'profileId', 'profileIds', 'name', 'names', 'profile', 'profiles']) {
+            exportParams.delete(key);
+            const values = Array.isArray(exportRequest[key]) ? exportRequest[key] : [exportRequest[key]];
+            for (const value of values) {
+                if (value !== undefined && value !== null) exportParams.append(key, String(value));
+            }
+        }
         const exportKind = exportFullMatch[1];
-        const selection = resolveApiExportProfiles(profiles, params, exportFullMatch[2] || '');
+        const selection = resolveApiExportProfiles(profiles, exportParams, exportFullMatch[2] || '');
         if (selection.error) return selection.error;
         if (exportKind === 'profile' && selection.selectedAll) {
             return { status: 400, data: { success: false, error: 'Profile id or name required' } };
         }
-        const password = params.get('password');
-        if (!password) return { status: 400, data: { success: false, error: 'Password required. Use ?password=yourpassword' } };
+        const password = typeof exportRequest.password === 'string' ? exportRequest.password : '';
+        if (!password || password.length > 1024) return { status: 400, data: { success: false, error: 'Password required in the request body' } };
         const selectedProfiles = selection.profiles;
+        if (selectedProfiles.some(profile => activeProcesses[profile.id] || launchingProfiles.has(profile.id))) {
+            return { status: 409, data: { success: false, error: 'Stop selected profiles before exporting browser data' } };
+        }
 
         const backupData = {
             version: 2,
@@ -2136,10 +2925,32 @@ async function handleApiRequest(method, pathname, body, params, context = {}) {
         };
     }
 
-    // GET /api/export/fingerprint - Export YAML fingerprints
+    // POST /api/export/fingerprint - Export YAML fingerprints
     const exportFingerprintMatch = pathname.match(/^\/api\/export\/fingerprint(?:\/([^\/]+))?$/);
-    if (method === 'GET' && exportFingerprintMatch) {
-        const selection = resolveApiExportProfiles(profiles, params, exportFingerprintMatch[1] || '');
+    if (exportFingerprintMatch) {
+        if (!context.exportAuthorized) return { status: 403, data: { success: false, error: 'Forbidden' } };
+        if (method !== 'POST') return { status: 405, data: { success: false, error: 'Use POST for sensitive exports' } };
+        let exportRequest;
+        try {
+            exportRequest = JSON.parse(body || '{}');
+        } catch {
+            return { status: 400, data: { success: false, error: 'Request body must be valid JSON' } };
+        }
+        if (!exportRequest || typeof exportRequest !== 'object' || Array.isArray(exportRequest)) {
+            return { status: 400, data: { success: false, error: 'Request body must be a JSON object' } };
+        }
+        if (params.has('password')) {
+            return { status: 400, data: { success: false, error: 'Password must be sent in the request body' } };
+        }
+        const exportParams = new URLSearchParams(params);
+        for (const key of ['id', 'ids', 'profileId', 'profileIds', 'name', 'names', 'profile', 'profiles']) {
+            exportParams.delete(key);
+            const values = Array.isArray(exportRequest[key]) ? exportRequest[key] : [exportRequest[key]];
+            for (const value of values) {
+                if (value !== undefined && value !== null) exportParams.append(key, String(value));
+            }
+        }
+        const selection = resolveApiExportProfiles(profiles, exportParams, exportFingerprintMatch[1] || '');
         if (selection.error) return selection.error;
         const selectedProfiles = selection.profiles;
         const exportData = selectedProfiles.map(p => ({
@@ -2249,6 +3060,7 @@ ipcMain.handle('stop-api-server', async () => {
         apiServer.close(() => {
             apiServer = null;
             apiServerRunning = false;
+            exportApiGrant = null;
             console.log('🔌 API Server stopped');
             resolve({ success: true });
         });
@@ -2256,7 +3068,36 @@ ipcMain.handle('stop-api-server', async () => {
 });
 
 ipcMain.handle('get-api-status', () => {
-    return { running: apiServerRunning };
+    return { running: apiServerRunning, authenticationRequired: true };
+});
+
+function isTrustedMainWindowEvent(event) {
+    return !!mainWindow && !mainWindow.isDestroyed() && event?.sender === mainWindow.webContents &&
+        (!event.senderFrame || !event.senderFrame.parent);
+}
+
+ipcMain.handle('copy-api-token', (event) => {
+    if (!isTrustedMainWindowEvent(event)) throw new Error('Unauthorized');
+    clipboard.writeText(publicApiToken);
+    return { success: true };
+});
+
+ipcMain.handle('copy-api-export-token', async (event) => {
+    if (!isTrustedMainWindowEvent(event)) throw new Error('Unauthorized');
+    const { response } = await dialog.showMessageBox({
+        type: 'warning',
+        buttons: ['取消', '复制导出授权令牌'],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+        title: 'GeekEZ Browser · 敏感导出授权',
+        message: '导出授权令牌可以读取环境指纹、Cookie、浏览器数据和 Guard 密码。',
+        detail: '仅复制给你信任的本地自动化程序。令牌 5 分钟后失效；导出请求仍需公共 API 令牌。'
+    });
+    if (response !== 1) return { success: false, canceled: true };
+    exportApiGrant = { token: createApiToken(), expiresAt: Date.now() + 5 * 60 * 1000 };
+    clipboard.writeText(exportApiGrant.token);
+    return { success: true, expiresAt: exportApiGrant.expiresAt };
 });
 
 
@@ -2271,13 +3112,42 @@ function forceKill(pid) {
 }
 
 function getChromiumPath() {
-    return chromiumLocator.getChromiumPath({
-        isDev,
-        appPath: app.getAppPath(),
-        resourcesPath: process.resourcesPath,
-        platform: process.platform,
-        env: process.env
-    });
+    const lookupContext = {};
+    lookupContext.isDev = Boolean(isDev);
+    lookupContext.appPath = app.getAppPath();
+    lookupContext.resourcesPath = process.resourcesPath;
+    lookupContext.platform = process.platform;
+    lookupContext.env = process.env;
+    return chromiumLocator.getChromiumPath(lookupContext);
+}
+
+function disableNativePasswordManager(userDataDir) {
+    if (!userDataDir) return;
+    const preferencesPath = path.join(userDataDir, 'Default', 'Preferences');
+    const temporaryPath = `${preferencesPath}.geekez-tmp`;
+    try {
+        fs.ensureDirSync(path.dirname(preferencesPath));
+        let preferences = {};
+        if (fs.existsSync(preferencesPath)) {
+            preferences = fs.readJsonSync(preferencesPath);
+        }
+        preferences.credentials_enable_service = false;
+        preferences.profile = {
+            ...(preferences.profile && typeof preferences.profile === 'object' ? preferences.profile : {}),
+            password_manager_enabled: false
+        };
+        fs.writeJsonSync(temporaryPath, preferences);
+        try {
+            fs.renameSync(temporaryPath, preferencesPath);
+        } catch (renameError) {
+            // Windows does not replace an existing file with renameSync.
+            fs.copyFileSync(temporaryPath, preferencesPath);
+            fs.removeSync(temporaryPath);
+        }
+    } catch (error) {
+        try { fs.removeSync(temporaryPath); } catch (cleanupError) { }
+        console.warn('[Password Manager] Failed to disable native password prompts:', error.message);
+    }
 }
 
 // Settings management
@@ -2384,11 +3254,53 @@ async function focusRunningProfileWindow(profileId) {
         }) || pages[0];
 
         if (!preferred) return false;
+        await ensureBrowserWindowVisible(preferred, { nudge: process.platform === 'win32' });
         await preferred.bringToFront();
         try { app.focus({ steal: true }); } catch (e) { }
         return true;
     } catch (e) {
         return false;
+    }
+}
+
+async function ensureBrowserWindowVisible(page, { nudge = false } = {}) {
+    if (!page || typeof page.createCDPSession !== 'function') return;
+    let session = null;
+    try {
+        session = await page.createCDPSession();
+        const { windowId } = await session.send('Browser.getWindowForTarget');
+        let bounds = {};
+        try { bounds = await session.send('Browser.getWindowBounds', { windowId }); } catch (e) { }
+        const display = screen.getDisplayNearestPoint({
+            x: Number.isFinite(bounds.left) ? bounds.left : 0,
+            y: Number.isFinite(bounds.top) ? bounds.top : 0
+        });
+        const workArea = display?.workArea || screen.getPrimaryDisplay().workArea;
+        const currentWidth = Number(bounds.width) || 1280;
+        const currentHeight = Number(bounds.height) || 800;
+        const width = Math.max(480, Math.min(currentWidth, workArea.width));
+        const height = Math.max(360, Math.min(currentHeight, workArea.height));
+        const currentLeft = Number.isFinite(bounds.left) ? bounds.left : workArea.x;
+        const currentTop = Number.isFinite(bounds.top) ? bounds.top : workArea.y;
+        const left = Math.max(workArea.x, Math.min(currentLeft, workArea.x + workArea.width - width));
+        const top = Math.max(workArea.y, Math.min(currentTop, workArea.y + workArea.height - height));
+        // Chromium can finish launching with a valid page but a hidden window
+        // on Windows. A short minimize/restore transition reliably activates
+        // the native window once its handle has been created.
+        if (nudge) {
+            await session.send('Browser.setWindowBounds', {
+                windowId,
+                bounds: { windowState: 'minimized' }
+            });
+            await sleep(80);
+        }
+        await session.send('Browser.setWindowBounds', {
+            windowId,
+            bounds: { left, top, width, height, windowState: 'normal' }
+        });
+    } catch (e) { }
+    finally {
+        try { await session?.detach(); } catch (e) { }
     }
 }
 
@@ -2408,6 +3320,7 @@ function quitApplication() {
 }
 
 function broadcastProfileStopped(profileId) {
+    configSync?.schedule();
     const windows = BrowserWindow.getAllWindows();
     for (const win of windows) {
         try {
@@ -2423,6 +3336,15 @@ async function stopRunningProfile(profileId, options = {}) {
     const proc = activeProcesses[profileId];
     if (!proc) return false;
 
+    proc.stopping = true;
+    try {
+        await passkeyRuntimes.get(profileId)?.manager?.flush();
+        await passkeyRuntimes.get(profileId)?.manager?.close();
+    } catch (failure) {
+        proc.stopping = false;
+        throw failure;
+    }
+    passkeyRuntimes.delete(profileId);
     clearProfileRuntimeLanguageState(profileId);
     await forceKill(proc.xrayPid);
     try { await proc.browser.close(); } catch (e) { }
@@ -2516,7 +3438,7 @@ async function buildTrayMenuTemplate() {
     const profiles = await readAllProfilesSafe();
     const runningIds = new Set(Object.keys(activeProcesses));
     const launchingIds = new Set(Array.from(launchingProfiles));
-    const lang = readSettingsSync().lang === 'en' ? 'en' : 'cn';
+    const lang = resolveSettingsUiLanguage(readSettingsSync());
 
     const createProfileMenuItem = (profile) => ({
         label: `${runningIds.has(profile.id) ? '🟢 ' : (launchingIds.has(profile.id) ? '🟡 ' : '')}${profile.name || profile.id}`,
@@ -2696,7 +3618,7 @@ function resolveWindowIconPath() {
 }
 
 function buildTrayTooltip() {
-    const lang = readSettingsSync().lang === 'en' ? 'en' : 'cn';
+    const lang = resolveSettingsUiLanguage(readSettingsSync());
     const launchingCount = launchingProfiles.size;
     const runningCount = Object.keys(activeProcesses).length;
 
@@ -2750,12 +3672,16 @@ async function createTray() {
 
 function createWindow() {
     const { width, height } = screen.getPrimaryDisplay().workAreaSize;
+    const systemVersion = typeof app.getSystemVersion === 'function' ? app.getSystemVersion() : '';
+    const materialOptions = getMainWindowMaterialOptions(process.platform, systemVersion);
     const win = new BrowserWindow({
         width: Math.round(width * 0.5), height: Math.round(height * 0.601), minWidth: 900, minHeight: 600,
-        title: "GeekEZ Browser", backgroundColor: '#1e1e2d',
+        title: "GeekEZ Browser",
         icon: resolveWindowIconPath(),
-        titleBarOverlay: { color: '#1e1e2d', symbolColor: '#ffffff', height: 35 },
-        titleBarStyle: 'hidden',
+        ...(process.platform !== 'darwin'
+            ? { titleBarOverlay: { color: '#1e1e2d', symbolColor: '#ffffff', height: 35 } }
+            : {}),
+        ...materialOptions,
         webPreferences: { 
             preload: path.join(__dirname, '../preload/index.js'), 
             contextIsolation: true, 
@@ -2774,18 +3700,20 @@ function createWindow() {
     
     mainWindow = win; // Store global reference for API
     win.on('close', (event) => {
-        if (isAppQuitting) return;
-
-        const closeAction = decideCloseAction(getCloseBehavior(), {
-            hasTrayEntry: hasUsableTrayEntry()
-        });
-        if (closeAction === CLOSE_BEHAVIOR.QUIT) {
-            event.preventDefault();
-            quitApplication();
+        if (isAppQuitting) {
             return;
         }
 
         event.preventDefault();
+        const shouldQuit = decideCloseAction(getCloseBehavior(), {
+            hasTrayEntry: hasUsableTrayEntry()
+        }) === CLOSE_BEHAVIOR.QUIT;
+
+        if (shouldQuit) {
+            quitApplication();
+            return;
+        }
+
         win.hide();
         if (process.platform === 'darwin' && app.dock && typeof app.dock.hide === 'function') {
             app.dock.hide();
@@ -2801,6 +3729,7 @@ function createWindow() {
 
 // Helper to notify UI to refresh profiles
 function notifyUIRefresh() {
+    configSync?.schedule();
     const windows = BrowserWindow.getAllWindows();
     windows.forEach((win) => {
         try {
@@ -2814,26 +3743,42 @@ function notifyUIRefresh() {
 async function generateExtension(profilePath, fingerprint, profileName, watermarkStyle, profileId) {
     const extDir = path.join(profilePath, 'extension');
     await fs.ensureDir(extDir);
+    const runtime = passkeyRuntimes.get(profileId);
+    if (!runtime) throw new Error('GeekEZ Guard runtime is not ready');
+    runtime.extensionOrigin = extensionOriginForPath(await fs.realpath(extDir));
 
     // 读取已保存的密码 (解密)
     const pwFile = path.join(DATA_PATH, profileId, 'passwords.json');
     const passwords = await readEncryptedPasswords(pwFile, profileId);
+    const syncStateFile = path.join(DATA_PATH, profileId, 'passwords-sync-state.json');
+    const syncState = fs.existsSync(syncStateFile) ? await fs.readJson(syncStateFile) : null;
 
-    // 内部扩展固定使用独立端口 12139
-    const apiPort = 12139;
+    if (!Number.isInteger(internalApiPort) || internalApiPort <= 0) {
+        throw new Error('GeekEZ Guard internal service is not ready');
+    }
+    const apiPort = internalApiPort;
+    const apiToken = passkeyRuntimes.get(profileId)?.token || '';
+    const backgroundConfig = {
+        profileId: profileId || '',
+        apiPort,
+        apiToken,
+        passwords,
+        snapshotRevision: syncState?.revision || ''
+    };
+    const backgroundFile = 'background.js';
 
     const manifest = {
         manifest_version: 3,
         name: "GeekEZ Guard",
-        version: "1.1.0",
+        version: "1.3.1",
         description: "Privacy & Password Protection",
-        permissions: ["storage", "activeTab", "declarativeNetRequest"],
-        host_permissions: ["<all_urls>", "http://127.0.0.1/*", "http://localhost/*"],
-        background: { service_worker: "background.js" },
+        permissions: ["storage", "activeTab"],
+        host_permissions: ["http://127.0.0.1/*", "http://localhost/*"],
+        background: { service_worker: backgroundFile },
         content_scripts: [
             {
                 matches: ["<all_urls>"],
-                js: ["geo.js", "content.js"],
+                js: ["content.js"],
                 run_at: "document_start",
                 all_frames: true,
                 match_about_blank: true,
@@ -2848,587 +3793,64 @@ async function generateExtension(profilePath, fingerprint, profileName, watermar
                 match_about_blank: true,
                 match_origin_as_fallback: true,
                 world: "ISOLATED"
-            },
-            {
-                matches: ["<all_urls>"],
-                js: ["runtime.js"],
-                run_at: "document_start",
-                all_frames: false,
-                match_about_blank: true,
-                match_origin_as_fallback: true,
-                world: "ISOLATED"
             }
         ],
         action: { default_popup: "popup.html" }
     };
     const style = watermarkStyle === 'banner' || watermarkStyle === 'off' ? watermarkStyle : 'enhanced';
-    const initialLanguageState = buildRuntimeLanguageState(fingerprint);
-    const geoScriptContent = getGeolocationScript(fingerprint);
     const scriptContent = getInjectScript(fingerprint, profileName, style);
-    await fs.writeJson(path.join(extDir, 'manifest.json'), manifest);
-    await fs.writeFile(path.join(extDir, 'geo.js'), geoScriptContent);
     await fs.writeFile(path.join(extDir, 'content.js'), scriptContent);
 
-    const runtimeJs = `
-(function() {
-    'use strict';
-    if (!chrome || !chrome.runtime || typeof chrome.runtime.sendMessage !== 'function') return;
-
-    let fastPollCount = 0;
-    let fastPollTimer = null;
-    let slowPollTimer = null;
-
-    function syncRuntimeLanguage() {
-        try {
-            chrome.runtime.sendMessage({ type: 'SYNC_RUNTIME_LANGUAGE' }, () => {
-                try { void chrome.runtime.lastError; } catch (e) { }
-            });
-        } catch (e) { }
-    }
-
-    function startSyncLoop() {
-        syncRuntimeLanguage();
-        if (fastPollTimer) clearInterval(fastPollTimer);
-        if (slowPollTimer) clearInterval(slowPollTimer);
-        fastPollCount = 0;
-        fastPollTimer = setInterval(() => {
-            fastPollCount += 1;
-            syncRuntimeLanguage();
-            if (fastPollCount >= 90) {
-                clearInterval(fastPollTimer);
-                fastPollTimer = null;
-                slowPollTimer = setInterval(syncRuntimeLanguage, 30000);
-            }
-        }, 1000);
-    }
-
-    startSyncLoop();
-    window.addEventListener('pageshow', syncRuntimeLanguage, { capture: true });
-    document.addEventListener('visibilitychange', syncRuntimeLanguage, { capture: true });
-})();
-`;
-    await fs.writeFile(path.join(extDir, 'runtime.js'), runtimeJs);
-
-    // --- background.js ---
-    const backgroundJs = `
-const PROFILE_ID = ${JSON.stringify(profileId || '')};
-const API_PORT = ${apiPort};
-const INIT_PASSWORDS = ${JSON.stringify(passwords)};
-const INIT_LANGUAGE_STATE = ${JSON.stringify(initialLanguageState)};
-const LANGUAGE_RULE_ID = 9101;
-const LANGUAGE_RESOURCE_TYPES = [
-    'main_frame',
-    'sub_frame',
-    'stylesheet',
-    'script',
-    'image',
-    'font',
-    'object',
-    'xmlhttprequest',
-    'ping',
-    'csp_report',
-    'media',
-    'websocket',
-    'other'
-];
-let lastLanguageStateKey = '';
-let runtimeLanguagePollTimer = null;
-let runtimeLanguagePollCount = 0;
-
-// 初始化密码数据
-chrome.runtime.onInstalled.addListener(() => { initPasswords(); startRuntimeLanguageSync(); });
-chrome.runtime.onStartup.addListener(() => { initPasswords(); startRuntimeLanguageSync(); });
-startRuntimeLanguageSync();
-
-async function initPasswords() {
-    const { geekez_passwords } = await chrome.storage.local.get('geekez_passwords');
-    if (!geekez_passwords || geekez_passwords.length === 0) {
-        if (INIT_PASSWORDS.length > 0) {
-            await chrome.storage.local.set({ geekez_passwords: INIT_PASSWORDS });
-        }
-    }
-}
-
-async function getPasswords() {
-    const { geekez_passwords } = await chrome.storage.local.get('geekez_passwords');
-    return geekez_passwords || [];
-}
-
-async function savePassword(entry) {
-    const pws = await getPasswords();
-    const idx = pws.findIndex(p => p.origin === entry.origin && p.username === entry.username);
-    const now = Date.now();
-    if (idx > -1) {
-        pws[idx] = { ...pws[idx], ...entry, updatedAt: now };
-    } else {
-        pws.push({ ...entry, createdAt: now, updatedAt: now });
-    }
-    await chrome.storage.local.set({ geekez_passwords: pws });
-    syncToElectron(pws);
-    return pws;
-}
-
-async function deletePassword(origin, username) {
-    let pws = await getPasswords();
-    pws = pws.filter(p => !(p.origin === origin && p.username === username));
-    await chrome.storage.local.set({ geekez_passwords: pws });
-    syncToElectron(pws);
-    return pws;
-}
-
-function syncToElectron(passwords) {
-    fetch(\`http://127.0.0.1:\${API_PORT}/api/passwords/sync\`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ profileId: PROFILE_ID, passwords })
-    }).then(r => r.json())
-      .then(res => console.log('Sync to Electron success:', res))
-      .catch(err => console.error('Sync to Electron falied:', err));
-}
-
-function normalizeRuntimeLanguageState(state) {
-    const enabled = !!state && !!state.enabled;
-    const acceptLanguageHeader = String(
-        state?.acceptLanguageHeader ||
-        state?.acceptLanguage ||
-        ''
-    ).trim();
-    const language = String(state?.language || '').trim();
-    const languages = Array.isArray(state?.languages)
-        ? state.languages.map(v => String(v || '').trim()).filter(Boolean)
-        : [];
-
-    if (!enabled || !acceptLanguageHeader || !language) {
-        return {
-            enabled: false,
-            language: '',
-            languages: [],
-            acceptLanguageHeader: '',
-            updatedAt: Number(state?.updatedAt || 0) || 0
-        };
-    }
-
-    return {
-        enabled: true,
-        language,
-        languages,
-        acceptLanguageHeader,
-        updatedAt: Number(state?.updatedAt || 0) || 0
-    };
-}
-
-function getLanguageStateKey(state) {
-    const normalized = normalizeRuntimeLanguageState(state);
-    return [
-        normalized.enabled ? '1' : '0',
-        normalized.language,
-        normalized.acceptLanguageHeader,
-        normalized.languages.join('|'),
-        normalized.updatedAt
-    ].join('::');
-}
-
-async function applyAcceptLanguageRule(state) {
-    const normalized = normalizeRuntimeLanguageState(state);
-    const api = chrome.declarativeNetRequest;
-    if (!api || typeof api.updateDynamicRules !== 'function') return;
-
-    if (!normalized.enabled) {
-        await api.updateDynamicRules({ removeRuleIds: [LANGUAGE_RULE_ID] });
-        return;
-    }
-
-    await api.updateDynamicRules({
-        removeRuleIds: [LANGUAGE_RULE_ID],
-        addRules: [{
-            id: LANGUAGE_RULE_ID,
-            priority: 100,
-            action: {
-                type: 'modifyHeaders',
-                requestHeaders: [{
-                    header: 'accept-language',
-                    operation: 'set',
-                    value: normalized.acceptLanguageHeader
-                }]
-            },
-            condition: {
-                regexFilter: '^https?://',
-                resourceTypes: LANGUAGE_RESOURCE_TYPES
-            }
-        }]
-    });
-}
-
-async function fetchRuntimeLanguageState() {
-    if (!PROFILE_ID) return normalizeRuntimeLanguageState(INIT_LANGUAGE_STATE);
-    const res = await fetch(\`http://127.0.0.1:\${API_PORT}/api/runtime/language?profileId=\${encodeURIComponent(PROFILE_ID)}&_=\${Date.now()}\`, {
-        method: 'GET',
-        cache: 'no-store'
-    });
-    if (!res.ok) throw new Error(\`runtime language HTTP \${res.status}\`);
-    return normalizeRuntimeLanguageState(await res.json());
-}
-
-async function syncRuntimeLanguage() {
-    try {
-        const state = await fetchRuntimeLanguageState();
-        const key = getLanguageStateKey(state);
-        if (key !== lastLanguageStateKey) {
-            await applyAcceptLanguageRule(state);
-            lastLanguageStateKey = key;
-        }
-    } catch (err) {
-        const fallbackKey = getLanguageStateKey(INIT_LANGUAGE_STATE);
-        if (fallbackKey !== lastLanguageStateKey) {
-            try {
-                await applyAcceptLanguageRule(INIT_LANGUAGE_STATE);
-                lastLanguageStateKey = fallbackKey;
-            } catch (e) { }
-        }
-    }
-}
-
-function startRuntimeLanguageSync() {
-    syncRuntimeLanguage();
-    if (runtimeLanguagePollTimer) {
-        clearInterval(runtimeLanguagePollTimer);
-    }
-    runtimeLanguagePollCount = 0;
-    runtimeLanguagePollTimer = setInterval(() => {
-        runtimeLanguagePollCount += 1;
-        syncRuntimeLanguage();
-        if (runtimeLanguagePollCount === 90) {
-            clearInterval(runtimeLanguagePollTimer);
-            runtimeLanguagePollTimer = setInterval(syncRuntimeLanguage, 30000);
-        }
-    }, 1000);
-}
-
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-    if (msg.type === 'SYNC_RUNTIME_LANGUAGE') {
-        syncRuntimeLanguage().then(() => sendResponse({ success: true })).catch(err => sendResponse({ success: false, error: err.message }));
-        return true;
-    }
-    if (msg.type === 'QUERY_PASSWORDS') {
-        getPasswords().then(pws => {
-            const matches = pws.filter(p => msg.origin && p.origin === msg.origin);
-            sendResponse({ passwords: matches });
-        });
-        return true;
-    }
-    if (msg.type === 'SAVE_PASSWORD') {
-        savePassword(msg.entry).then(pws => sendResponse({ success: true, count: pws.length }));
-        return true;
-    }
-    if (msg.type === 'DELETE_PASSWORD') {
-        deletePassword(msg.origin, msg.username).then(pws => sendResponse({ success: true, count: pws.length }));
-        return true;
-    }
-    if (msg.type === 'GET_ALL_PASSWORDS') {
-        getPasswords().then(pws => sendResponse({ passwords: pws }));
-        return true;
-    }
-});
-`;
-    await fs.writeFile(path.join(extDir, 'background.js'), backgroundJs);
-
-    // --- content_pw.js (密码自动填充 + 保存检测) ---
-    const contentPwJs = `
-(function() {
-    'use strict';
-    let fillAttempted = false;
-
-    function getOrigin() { return location.origin; }
-
-    function findPasswordFields() {
-        return Array.from(document.querySelectorAll('input[type="password"]:not([data-geekez-processed])'));
-    }
-
-    function findUsernameField(pwField) {
-        const form = pwField.closest('form') || document.body;
-        const inputs = Array.from(form.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]):not([type="checkbox"]):not([type="radio"])'));
-        const pwIdx = inputs.indexOf(pwField);
-        for (let i = pwIdx - 1; i >= 0; i--) {
-            const inp = inputs[i];
-            const t = (inp.type || '').toLowerCase();
-            const n = (inp.name || '').toLowerCase();
-            const id = (inp.id || '').toLowerCase();
-            const ac = (inp.autocomplete || '').toLowerCase();
-            if (t === 'email' || t === 'text' || t === 'tel' ||
-                ac.includes('username') || ac.includes('email') ||
-                n.includes('user') || n.includes('email') || n.includes('login') || n.includes('account') ||
-                id.includes('user') || id.includes('email') || id.includes('login') || id.includes('account')) {
-                return inp;
-            }
-        }
-        if (pwIdx > 0) return inputs[pwIdx - 1];
-        return null;
-    }
-
-    function createFillButton(pwField, passwords) {
-        if (passwords.length === 0) return;
-        const btn = document.createElement('div');
-        btn.setAttribute('data-geekez-fill', 'true');
-        btn.style.cssText = 'position:absolute;width:20px;height:20px;cursor:pointer;z-index:999999;background:#4285f4;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;color:#fff;box-shadow:0 1px 3px rgba(0,0,0,.3);';
-        btn.textContent = 'G';
-        btn.title = 'GeeKez 自动填充';
-
-        const rect = pwField.getBoundingClientRect();
-        btn.style.position = 'absolute';
-        btn.style.left = (rect.right - 25 + window.scrollX) + 'px';
-        btn.style.top = (rect.top + (rect.height - 20) / 2 + window.scrollY) + 'px';
-
-        btn.addEventListener('click', (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            if (passwords.length === 1) {
-                doFill(pwField, passwords[0]);
-            } else {
-                showDropdown(btn, pwField, passwords);
-            }
-        });
-        document.body.appendChild(btn);
-    }
-
-    function showDropdown(anchor, pwField, passwords) {
-        const existing = document.querySelector('[data-geekez-dropdown]');
-        if (existing) existing.remove();
-        const dd = document.createElement('div');
-        dd.setAttribute('data-geekez-dropdown', 'true');
-        dd.style.cssText = 'position:absolute;z-index:9999999;background:#fff;border:1px solid #ddd;border-radius:8px;box-shadow:0 4px 12px rgba(0,0,0,.15);min-width:200px;max-height:200px;overflow-y:auto;';
-        const r = anchor.getBoundingClientRect();
-        dd.style.left = (r.left + window.scrollX) + 'px';
-        dd.style.top = (r.bottom + 4 + window.scrollY) + 'px';
-        passwords.forEach(pw => {
-            const item = document.createElement('div');
-            item.style.cssText = 'padding:8px 12px;cursor:pointer;font-size:13px;border-bottom:1px solid #f0f0f0;';
-            item.textContent = pw.username;
-            item.addEventListener('mouseenter', () => item.style.background = '#f5f5f5');
-            item.addEventListener('mouseleave', () => item.style.background = '#fff');
-            item.addEventListener('click', () => { doFill(pwField, pw); dd.remove(); });
-            dd.appendChild(item);
-        });
-        document.body.appendChild(dd);
-        setTimeout(() => document.addEventListener('click', () => dd.remove(), { once: true }), 100);
-    }
-
-    function doFill(pwField, pw) {
-        const userField = findUsernameField(pwField);
-        if (userField) setVal(userField, pw.username);
-        setVal(pwField, pw.password);
-    }
-
-    function setVal(el, val) {
-        const nativeSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
-        if(nativeSetter) nativeSetter.call(el, val);
-        else el.value = val;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-    }
-
-    // 保存最后输入的凭据
-    let lastCreds = { origin: getOrigin(), url: location.href, name: location.hostname };
-
-    function processPage() {
-        const pwFields = findPasswordFields();
-        if (pwFields.length === 0) return;
-        
-        pwFields.forEach(pwField => {
-            if (pwField.hasAttribute('data-geekez-processed')) return;
-            pwField.setAttribute('data-geekez-processed', 'true');
-            
-            // 记录用户输入，即使没有form submit也能捕获
-            pwField.addEventListener('blur', () => {
-                if (pwField.value) {
-                    lastCreds.password = pwField.value;
-                    const uField = findUsernameField(pwField);
-                    if (uField && uField.value) lastCreds.username = uField.value;
-                }
-            });
-            const uField = findUsernameField(pwField);
-            if (uField) {
-                uField.addEventListener('blur', () => {
-                   if (uField.value) lastCreds.username = uField.value; 
-                });
-            }
-        });
-
-        chrome.runtime.sendMessage({ type: 'QUERY_PASSWORDS', origin: getOrigin() }, (resp) => {
-            if (!resp || !resp.passwords) return;
-            pwFields.forEach(pwField => {
-                if(!pwField.hasAttribute('data-geekez-btn-added')) {
-                    pwField.setAttribute('data-geekez-btn-added', 'true');
-                    createFillButton(pwField, resp.passwords);
-                }
-                if (!fillAttempted && resp.passwords.length === 1) {
-                    fillAttempted = true;
-                    doFill(pwField, resp.passwords[0]);
-                }
-            });
-        });
-    }
-
-    // 监听表单提交 - 提示保存密码
-    function monitorSubmit() {
-        function attemptSave(pwField) {
-            let uVal = lastCreds.username, pVal = lastCreds.password;
-            if (pwField && pwField.value) pVal = pwField.value;
-            if (pwField) {
-                const uField = findUsernameField(pwField);
-                if (uField && uField.value) uVal = uField.value;
-            }
-            if (uVal && pVal) {
-                chrome.runtime.sendMessage({ type: 'SAVE_PASSWORD', entry: { ...lastCreds, username: uVal, password: pVal } });
-            }
-        }
-
-        document.addEventListener('submit', (e) => {
-            const form = e.target;
-            const pwField = form.querySelector('input[type="password"]') || Array.from(document.querySelectorAll('input[type="password"]')).pop();
-            attemptSave(pwField);
-        }, true);
-
-        // 也监听点击登录按钮 (扩大范围，捕获 div/span 等模拟按钮)
-        document.addEventListener('click', (e) => {
-            const el = e.target;
-            const text = (el.innerText || el.textContent || '').toLowerCase();
-            const btn = el.closest('button, input[type="submit"], input[type="button"], .btn, .button');
-            
-            if (btn || text.includes('log in') || text.includes('login') || text.includes('sign in') || text.includes('signin') || text.includes('登录') || text.includes('登入')) {
-                const pwField = (btn ? btn.closest('form') : null)?.querySelector('input[type="password"]') || Array.from(document.querySelectorAll('input[type="password"]')).pop();
-                attemptSave(pwField);
-            }
-        }, true);
-        
-        // 离开页面前如果有输入也尝试保存
-        window.addEventListener('beforeunload', () => {
-            if (lastCreds.username && lastCreds.password) {
-                chrome.runtime.sendMessage({ type: 'SAVE_PASSWORD', entry: lastCreds });
-            }
-        });
-    }
-
-    processPage();
-    monitorSubmit();
-    const obs = new MutationObserver(() => { setTimeout(processPage, 500); });
-    obs.observe(document.body, { childList: true, subtree: true });
-})();
-`;
-    await fs.writeFile(path.join(extDir, 'content_pw.js'), contentPwJs);
-
-    // --- popup.html ---
-    const popupHtml = `<!DOCTYPE html>
-<html><head><meta charset="utf-8">
-<style>
-*{margin:0;padding:0;box-sizing:border-box}
-body{width:320px;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;background:#1a1a2e;color:#e0e0e0;font-size:13px}
-.header{padding:12px 16px;background:linear-gradient(135deg,#16213e,#0f3460);display:flex;align-items:center;gap:8px}
-.header h1{font-size:15px;font-weight:600;color:#e94560}
-.header span{font-size:11px;color:#888;margin-left:auto}
-.list{max-height:300px;overflow-y:auto;padding:4px 0}
-.item{padding:10px 16px;border-bottom:1px solid #222;cursor:pointer;transition:background .15s}
-.item:hover{background:#16213e}
-.item .site{font-weight:500;color:#e94560;font-size:12px;margin-bottom:2px}
-.item .user{color:#ccc;font-size:12px}
-.item .actions{display:flex;gap:6px;margin-top:4px}
-.item .actions button{background:none;border:1px solid #444;color:#aaa;font-size:10px;padding:2px 8px;border-radius:4px;cursor:pointer}
-.item .actions button:hover{border-color:#e94560;color:#e94560}
-.empty{padding:24px 16px;text-align:center;color:#666;font-size:12px}
-.add-form{padding:12px 16px;border-top:1px solid #333}
-.add-form input{width:100%;padding:6px 8px;margin:3px 0;background:#16213e;border:1px solid #333;border-radius:4px;color:#e0e0e0;font-size:12px}
-.add-form button{width:100%;padding:6px;margin-top:6px;background:#e94560;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:12px;font-weight:500}
-.add-form button:hover{background:#c73450}
-.add-pw-btn{display:block;width:100%;padding:8px;background:none;border:none;border-top:1px solid #333;color:#e94560;cursor:pointer;font-size:12px}
-</style></head>
-<body>
-<div class="header"><h1>🔑 GeeKez</h1><span>密码管理</span></div>
-<div class="list" id="list"></div>
-<button class="add-pw-btn" id="addPwBtn">+ 添加密码</button>
-<div class="add-form" id="addForm" style="display:none">
-<input id="addUrl" placeholder="网址 URL"><input id="addUser" placeholder="用户名"><input id="addPw" type="password" placeholder="密码">
-<button id="addBtn">保存</button>
-</div>
-<script src="popup.js"></script>
-</body></html>`;
-    await fs.writeFile(path.join(extDir, 'popup.html'), popupHtml);
-
-    // --- popup.js ---
-    const popupJs = `
-document.addEventListener('DOMContentLoaded', async () => {
-    const list = document.getElementById('list');
-    const addPwBtn = document.getElementById('addPwBtn');
-    const addForm = document.getElementById('addForm');
-    const addBtn = document.getElementById('addBtn');
-
-    addPwBtn.addEventListener('click', () => {
-        addForm.style.display = addForm.style.display === 'none' ? 'block' : 'none';
-    });
-
-    addBtn.addEventListener('click', () => {
-        const url = document.getElementById('addUrl').value.trim();
-        const user = document.getElementById('addUser').value.trim();
-        const pw = document.getElementById('addPw').value;
-        if (!url || !user || !pw) return;
-        let origin;
-        try { origin = new URL(url).origin; } catch { origin = url; }
-        chrome.runtime.sendMessage({
-            type: 'SAVE_PASSWORD',
-            entry: { url, origin, username: user, password: pw, name: new URL(url).hostname || url }
-        }, () => { loadList(); addForm.style.display = 'none'; });
-    });
-
-    function loadList() {
-        chrome.runtime.sendMessage({ type: 'GET_ALL_PASSWORDS' }, (resp) => {
-            const pws = (resp && resp.passwords) || [];
-            if (pws.length === 0) {
-                list.innerHTML = '<div class="empty">暂无保存的密码</div>';
-                return;
-            }
-            list.innerHTML = pws.map(pw => \`
-                <div class="item">
-                    <div class="site">\${esc(pw.name || pw.origin)}</div>
-                    <div class="user">\${esc(pw.username)}</div>
-                    <div class="actions">
-                        <button data-action="copy" data-pw="\${esc(pw.password)}">复制密码</button>
-                        <button data-action="delete" data-origin="\${esc(pw.origin)}" data-user="\${esc(pw.username)}">删除</button>
-                    </div>
-                </div>
-            \`).join('');
-
-            list.querySelectorAll('[data-action="copy"]').forEach(btn => {
-                btn.addEventListener('click', () => {
-                    navigator.clipboard.writeText(btn.dataset.pw).then(() => { btn.textContent = '✓ 已复制'; setTimeout(() => btn.textContent = '复制密码', 1500); });
-                });
-            });
-            list.querySelectorAll('[data-action="delete"]').forEach(btn => {
-                btn.addEventListener('click', () => {
-                    chrome.runtime.sendMessage({ type: 'DELETE_PASSWORD', origin: btn.dataset.origin, username: btn.dataset.user }, () => loadList());
-                });
-            });
-        });
-    }
-
-    function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
-    loadList();
-});
-`;
-    await fs.writeFile(path.join(extDir, 'popup.js'), popupJs);
+    await fs.writeJson(path.join(extDir, 'guard-config.json'), backgroundConfig);
+    await fs.writeFile(path.join(extDir, backgroundFile), guardBackground);
+    await fs.writeFile(path.join(extDir, 'content_pw.js'), guardPasswordContent);
+    await fs.writeFile(path.join(extDir, 'popup.html'), guardPopupHtml);
+    await fs.writeFile(path.join(extDir, 'popup.js'), guardPopupScript);
+    await fs.copy(require.resolve('jsqr'), path.join(extDir, 'jsqr.js'));
+    await fs.writeJson(path.join(extDir, 'manifest.json'), manifest);
+    const staleBackgrounds = (await fs.readdir(extDir)).filter(file =>
+        file !== backgroundFile && /^(?:background\.js|background-[a-f0-9]{16}\.js)$/.test(file));
+    for (const file of staleBackgrounds) await fs.remove(path.join(extDir, file));
 
     return extDir;
 }
 
 app.whenReady().then(async () => {
-    cachedCloseBehavior = normalizeCloseBehavior(readSettingsSync().closeBehavior);
-    createWindow();
-    await createTray().catch((err) => {
-        console.error('Failed to initialize tray:', err);
+    configSync = createProfileSync({
+        app, safeStorage, ipcMain, dialog,
+        paths: { DATA_PATH, PROFILES_FILE, SETTINGS_FILE, DEFAULT_PASSWORDS_FILE },
+        helpers: {
+            runProfileApiTask, readEncryptedPasswords, readDefaultPasswordSettings, normalizeDefaultPasswords,
+            readPasskeyStore,
+            normalizeSettingsSnapshot, normalizeBookmarksDocument, buildProfileFromInput, encryptData,
+            commitProfileFiles, profileResourceWrites, notifyUIRefresh,
+            onSettingsApplied: settings => { cachedCloseBehavior = normalizeCloseBehavior(settings.closeBehavior); },
+            busyProfileIds: () => [...new Set([...Object.keys(activeProcesses), ...launchingProfiles,
+                ...[...passkeyRuntimes].filter(([, runtime]) => runtime.storageError).map(([id]) => id)])]
+        },
+        broadcast: (channel, payload) => BrowserWindow.getAllWindows().forEach(win => {
+            if (!win.isDestroyed() && !win.webContents.isDestroyed()) win.webContents.send(channel, payload);
+        })
     });
+    await configSync.init().then(() => configSync.schedule()).catch(error => {
+        configSync.credentials = null;
+        configSync.setStatus({ phase: 'error', error: 'syncLocalError' });
+        console.error('[Config Sync] Initialization failed:', error.message);
+    });
+    cachedCloseBehavior = normalizeCloseBehavior(readSettingsSync().closeBehavior);
+    initializeProxyRecoveryMonitor();
 
-    // Auto-start internal API server explicitly for GeekEZ Guard
+    // Start the authenticated Guard API before any environment can generate its config.
     try {
         internalApiServer = createInternalApiServer();
-        internalApiServer.listen(INTERNAL_API_PORT, '127.0.0.1', () => {
-            console.log(`🛡️ Internal Guard Server auto-started on http://localhost:${INTERNAL_API_PORT}`);
+        await new Promise((resolve, reject) => {
+            internalApiServer.once('error', reject);
+            internalApiServer.listen(0, '127.0.0.1', () => {
+                internalApiServer.off('error', reject);
+                internalApiPort = internalApiServer.address().port;
+                console.log('🛡️ Internal Guard Server started on an ephemeral loopback port');
+                resolve();
+            });
         });
         internalApiServer.on('error', (err) => {
             console.error('Internal Guard Server failed to start:', err);
@@ -3436,6 +3858,11 @@ app.whenReady().then(async () => {
     } catch (e) {
         console.error('Failed to auto-start Internal Guard Server:', e);
     }
+
+    createWindow();
+    await createTray().catch((err) => {
+        console.error('Failed to initialize tray:', err);
+    });
 
     // Auto-start public API server if enabled
     try {
@@ -3465,7 +3892,16 @@ app.on('activate', () => {
 });
 
 // IPC Handles
-ipcMain.handle('get-app-info', () => { return { name: app.getName(), version: app.getVersion() }; });
+ipcMain.handle('get-app-info', () => {
+    const systemVersion = typeof app.getSystemVersion === 'function' ? app.getSystemVersion() : '';
+    return {
+        name: app.getName(),
+        version: app.getVersion(),
+        platform: process.platform,
+        systemVersion,
+        nativeGlass: supportsNativeGlass(process.platform, systemVersion)
+    };
+});
 
 // Check for updates via GitHub Releases API
 ipcMain.handle('check-updates', async () => {
@@ -3521,6 +3957,19 @@ async function waitForLocalPortReady(port, timeoutMs = 1500) {
     return false;
 }
 
+function spawnXrayProcess(configPath, logFd) {
+    const child = spawn(BIN_PATH, ['-c', configPath], {
+        cwd: BIN_DIR,
+        env: { ...process.env, 'XRAY_LOCATION_ASSET': RESOURCES_BIN },
+        stdio: ['ignore', logFd, logFd],
+        windowsHide: true
+    });
+    child.once('error', (error) => {
+        console.error(`[Xray Process Error] ${error?.message || error}`);
+    });
+    return child;
+}
+
 function readFileTailSafe(filePath, maxLength = 500) {
     try {
         if (!filePath || !fs.existsSync(filePath)) return '';
@@ -3532,8 +3981,139 @@ function readFileTailSafe(filePath, maxLength = 500) {
     }
 }
 
+function readFileSinceSafe(filePath, startOffset = 0, maxLength = 4000) {
+    let fd;
+    try {
+        if (!filePath || !fs.existsSync(filePath)) return '';
+        fd = fs.openSync(filePath, 'r');
+        const size = fs.fstatSync(fd).size;
+        if (size <= startOffset) return '';
+        const position = Math.max(startOffset, size - maxLength);
+        const length = size - position;
+        const buffer = Buffer.alloc(length);
+        fs.readSync(fd, buffer, 0, length, position);
+        return buffer.toString('utf8');
+    } catch (e) {
+        return '';
+    } finally {
+        if (fd !== undefined) {
+            try { fs.closeSync(fd); } catch (e) { }
+        }
+    }
+}
+
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Puppeteer 25 exposes browser connectivity as a property. Older releases used
+// isConnected(), so keep this check compatible with both versions and with the
+// Windows packaged runtime.
+function isBrowserConnected(browser) {
+    if (!browser) return false;
+    try {
+        if (typeof browser.isConnected === 'function') return browser.isConnected();
+        if (typeof browser.connected === 'boolean') return browser.connected;
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+function attachXrayExitRecovery(profileId, child) {
+    if (!child) return;
+    const scheduleRecovery = (code, signal) => {
+        const proc = activeProcesses[profileId];
+        if (!proc || proc.stopping || proc.xrayProcess !== child) return;
+        proc.xrayPid = null;
+        console.warn(`[Xray Recovery] ${profileId}: process exited (code=${code}, signal=${signal || 'none'})`);
+        setTimeout(() => {
+            recoverProfileProxy(profileId, 'unexpected-xray-exit').catch((error) => {
+                console.error(`[Xray Recovery] ${profileId}: ${error?.message || error}`);
+            });
+        }, 500);
+    };
+
+    if (child.exitCode !== null) {
+        scheduleRecovery(child.exitCode, child.signalCode);
+        return;
+    }
+    child.once('exit', scheduleRecovery);
+}
+
+async function restartProfileXray(profileId, proc, reason) {
+    const previousPid = proc.xrayPid;
+    proc.xrayPid = null;
+    proc.xrayProcess = null;
+    await forceKill(previousPid);
+    await sleep(150);
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        if (activeProcesses[profileId] !== proc || proc.stopping || !isBrowserConnected(proc.browser)) {
+            return false;
+        }
+
+        const child = spawnXrayProcess(proc.xrayConfigPath, proc.logFd);
+        proc.xrayProcess = child;
+        proc.xrayPid = child.pid || null;
+        attachXrayExitRecovery(profileId, child);
+
+        if (await waitForLocalPortReady(proc.localPort, 2500)) {
+            await sleep(100);
+            if (child.exitCode === null) {
+                console.log(`[Xray Recovery] ${profileId}: restored on port ${proc.localPort} (${reason})`);
+                return true;
+            }
+        }
+
+        if (proc.xrayProcess === child) {
+            proc.xrayProcess = null;
+            proc.xrayPid = null;
+        }
+        await forceKill(child.pid);
+        if (attempt < 3) await sleep(250);
+    }
+
+    console.error(`[Xray Recovery] ${profileId}: failed to restore on port ${proc.localPort} (${reason})`);
+    return false;
+}
+
+async function recoverProfileProxy(profileId, reason = 'runtime-health-check') {
+    const proc = activeProcesses[profileId];
+    if (!proc || proc.stopping || proc.recoveringProxy || !proc.localPort || !proc.xrayConfigPath) {
+        return false;
+    }
+
+    proc.recoveringProxy = true;
+    try {
+        const health = await waitForSocksProxyUsable(proc.localPort, 4500, 1200, proc.xrayProcess);
+        if (health.success) return true;
+        if (activeProcesses[profileId] !== proc || proc.stopping || !isBrowserConnected(proc.browser)) {
+            return false;
+        }
+
+        console.warn(`[Xray Recovery] ${profileId}: proxy unhealthy after ${reason}: ${health.msg || 'unknown'}`);
+        return await restartProfileXray(profileId, proc, reason);
+    } finally {
+        proc.recoveringProxy = false;
+    }
+}
+
+function initializeProxyRecoveryMonitor() {
+    let resumeTimer = null;
+    const scheduleRecovery = (reason) => {
+        if (resumeTimer) clearTimeout(resumeTimer);
+        resumeTimer = setTimeout(() => {
+            resumeTimer = null;
+            for (const profileId of Object.keys(activeProcesses)) {
+                recoverProfileProxy(profileId, reason).catch((error) => {
+                    console.error(`[Xray Recovery] ${profileId}: ${error?.message || error}`);
+                });
+            }
+        }, 2500);
+    };
+    powerMonitor.on('resume', () => scheduleRecovery('system-resume'));
+    powerMonitor.on('unlock-screen', () => scheduleRecovery('screen-unlock'));
 }
 
 function formatProbeDetail(detail = {}) {
@@ -3911,7 +4491,21 @@ ipcMain.handle('test-proxy-latency-batch', async (_e, entries) => {
         return { id, ...result };
     });
 });
-ipcMain.handle('set-title-bar-color', (e, colors) => { const win = BrowserWindow.fromWebContents(e.sender); if (win) { if (process.platform === 'win32') try { win.setTitleBarOverlay({ color: colors.bg, symbolColor: colors.symbol }); } catch (e) { } win.setBackgroundColor(colors.bg); } });
+ipcMain.handle('set-title-bar-color', (e, colors) => {
+    const win = BrowserWindow.fromWebContents(e.sender);
+    if (!win) return;
+
+    const systemVersion = typeof app.getSystemVersion === 'function' ? app.getSystemVersion() : '';
+    if (supportsNativeGlass(process.platform, systemVersion)) {
+        try { win.setBackgroundColor('#00000000'); } catch (error) { }
+        return;
+    }
+
+    if (process.platform === 'win32') {
+        try { win.setTitleBarOverlay({ color: colors.bg, symbolColor: colors.symbol }); } catch (error) { }
+    }
+    win.setBackgroundColor(colors.bg);
+});
 ipcMain.handle('check-app-update', async () => { try { const releaseInfo = await fetchLatestGitHubReleaseInfo({ owner: 'EchoHS', repo: 'GeekezBrowser', currentVersion: app.getVersion() }); if (compareVersions(releaseInfo.latestVersion, app.getVersion()) > 0) { return { update: true, remote: releaseInfo.latestVersion, url: 'https://browser.geekez.net/#downloads', notes: releaseInfo.notes }; } return { update: false }; } catch (e) { return { update: false, error: e.message }; } });
 async function checkXrayUpdateAvailable() {
     try {
@@ -3920,7 +4514,7 @@ async function checkXrayUpdateAvailable() {
 
         const remoteVersion = release.tag_name;
         const localVersion = await getLocalXrayVersion();
-        if (remoteVersion === localVersion) return { update: false };
+        if (compareVersions(remoteVersion, localVersion) <= 0) return { update: false };
 
         const assetName = xrayRelease.resolveXrayAssetName({
             platform: os.platform(),
@@ -3941,7 +4535,10 @@ async function checkXrayUpdateAvailable() {
 }
 ipcMain.handle('check-xray-update', checkXrayUpdateAvailable);
 ipcMain.handle('download-xray-update', async (e, url) => {
+    if (xrayUpdateInProgress) return false;
+    xrayUpdateInProgress = true;
     const exeName = process.platform === 'win32' ? 'xray.exe' : 'xray';
+    const expectedVersion = String(url || '').match(/\/download\/(v?\d+\.\d+\.\d+)\//i)?.[1] || '';
     const tempBase = os.tmpdir();
     const updateId = `xray_update_${Date.now()}`;
     const tempDir = path.join(tempBase, updateId);
@@ -3949,9 +4546,6 @@ ipcMain.handle('download-xray-update', async (e, url) => {
     try {
         fs.mkdirSync(tempDir, { recursive: true });
         await downloadFile(url, zipPath);
-        if (process.platform === 'win32') await new Promise((resolve) => exec('taskkill /F /IM xray.exe', () => resolve()));
-        activeProcesses = {};
-        await new Promise(r => setTimeout(r, 3000));
         const extractDir = path.join(tempDir, 'extracted');
         fs.mkdirSync(extractDir, { recursive: true });
         await extractZip(zipPath, extractDir);
@@ -3993,22 +4587,52 @@ ipcMain.handle('download-xray-update', async (e, url) => {
             throw new Error('Xray binary not found in package');
         }
 
+        const extractedVersion = await getXrayVersion(xrayBinary);
+        if (extractedVersion === 'v0.0.0') {
+            throw new Error('Downloaded Xray binary version could not be detected');
+        }
+        if (expectedVersion && compareVersions(extractedVersion, expectedVersion) !== 0) {
+            throw new Error(`Downloaded Xray version mismatch: expected ${expectedVersion}, got ${extractedVersion}`);
+        }
+
+        // Stop environments before replacing Xray. Clearing activeProcesses
+        // without closing Puppeteer leaves Chrome processes alive and their
+        // browser_data SingletonLock files survive the next app restart.
+        if (launchingProfiles.size > 0) {
+            throw new Error('Please wait for profile startup to finish before updating Xray');
+        }
+        await stopAllRunningProfilesFromTray();
+
         // Windows文件锁规避：先重命名旧文件，再复制新文件
         const oldPath = BIN_PATH + '.old';
+        let oldBinaryMoved = false;
         if (fs.existsSync(BIN_PATH)) {
             try {
                 if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
             } catch (e) { }
             fs.renameSync(BIN_PATH, oldPath);
+            oldBinaryMoved = true;
         }
-        fs.ensureDirSync(BIN_DIR);
-        fs.copyFileSync(xrayBinary, BIN_PATH);
-        if (process.platform !== 'win32') fs.chmodSync(BIN_PATH, '755');
-        // 删除旧文件
         try {
-            if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
-        } catch (e) { }
-        if (process.platform !== 'win32') fs.chmodSync(BIN_PATH, '755');
+            fs.ensureDirSync(BIN_DIR);
+            fs.copyFileSync(xrayBinary, BIN_PATH);
+            if (process.platform !== 'win32') fs.chmodSync(BIN_PATH, '755');
+            const installedVersion = await getXrayVersion(BIN_PATH);
+            if (installedVersion !== extractedVersion) {
+                throw new Error(`Installed Xray version mismatch: expected ${extractedVersion}, got ${installedVersion}`);
+            }
+            try {
+                if (fs.existsSync(oldPath)) fs.unlinkSync(oldPath);
+            } catch (e) { }
+        } catch (error) {
+            try {
+                if (fs.existsSync(BIN_PATH)) fs.unlinkSync(BIN_PATH);
+            } catch (cleanupError) { }
+            if (oldBinaryMoved && fs.existsSync(oldPath)) {
+                fs.renameSync(oldPath, BIN_PATH);
+            }
+            throw error;
+        }
         // 清理临时目录（即使失败也不影响更新）
         try {
             fs.rmSync(tempDir, { recursive: true, force: true });
@@ -4022,6 +4646,8 @@ ipcMain.handle('download-xray-update', async (e, url) => {
             if (fs.existsSync(tempDir)) fs.rmSync(tempDir, { recursive: true, force: true });
         } catch (err) { }
         return false;
+    } finally {
+        xrayUpdateInProgress = false;
     }
 });
 ipcMain.handle('get-running-ids', () => Object.keys(activeProcesses));
@@ -4030,7 +4656,7 @@ ipcMain.handle('get-profile-runtime-state', () => ({
     launchingIds: Array.from(launchingProfiles)
 }));
 ipcMain.handle('get-profiles', async () => { if (!fs.existsSync(PROFILES_FILE)) return []; return fs.readJson(PROFILES_FILE); });
-ipcMain.handle('update-profile', async (event, updatedProfile) => {
+ipcMain.handle('update-profile', (event, updatedProfile) => runProfileApiTask(async () => {
     const profiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
     const index = profiles.findIndex(p => p.id === updatedProfile.id);
     if (index === -1) return false;
@@ -4042,17 +4668,21 @@ ipcMain.handle('update-profile', async (event, updatedProfile) => {
     await fs.writeJson(PROFILES_FILE, profiles);
     notifyUIRefresh();
     return true;
-});
-ipcMain.handle('save-profile', async (event, data) => {
+}));
+ipcMain.handle('save-profile', (event, data) => runProfileApiTask(async () => {
     const profiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
     const settings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : {};
-    const newProfile = await buildProfileFromInput(data, profiles, settings);
+    let newProfile = await applyDefaultBookmarksToProfile(
+        await buildProfileFromInput(data, profiles, settings),
+        settings
+    );
+    newProfile = await applyDefaultPasswordsToProfile(newProfile, settings);
     profiles.push(newProfile);
     await fs.writeJson(PROFILES_FILE, profiles);
     notifyUIRefresh();
     return newProfile;
-});
-ipcMain.handle('reorder-profiles', async (event, orderedIds) => {
+}));
+ipcMain.handle('reorder-profiles', (event, orderedIds) => runProfileApiTask(async () => {
     if (!Array.isArray(orderedIds)) return false;
     const profiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
     const currentIds = profiles.map(profile => profile.id);
@@ -4065,8 +4695,8 @@ ipcMain.handle('reorder-profiles', async (event, orderedIds) => {
     await fs.writeJson(PROFILES_FILE, nextIds.map(id => byId.get(id)));
     notifyUIRefresh();
     return true;
-});
-ipcMain.handle('delete-profile', async (event, id) => {
+}));
+ipcMain.handle('delete-profile', (event, id) => runProfileApiTask(async () => {
     // 关闭正在运行的进程
     if (activeProcesses[id]) {
         await stopRunningProfile(id, { refreshMenu: false });
@@ -4119,32 +4749,55 @@ ipcMain.handle('delete-profile', async (event, id) => {
     }
 
     return true;
-});
+}));
 ipcMain.handle('get-settings', async () => {
-    if (!fs.existsSync(SETTINGS_FILE)) {
-        return {
+    const storedSettings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : {};
+    const hasStoredPasswordScope = Object.prototype.hasOwnProperty.call(storedSettings, 'defaultPasswordScope');
+    const normalized = normalizeSettingsSnapshot(storedSettings);
+    const defaultPasswordSettings = await readDefaultPasswordSettings();
+    const scope = hasStoredPasswordScope
+        ? normalized.defaultPasswordScope
+        : defaultPasswordSettings.scope;
+    return {
+            ...normalized,
+            systemLanguage: getSystemUiLanguage(),
+            defaultPasswords: defaultPasswordSettings.passwords,
+            defaultPasswordScope: scope,
+            ...(fs.existsSync(SETTINGS_FILE) ? {} : {
             preProxies: [],
             mode: 'single',
             enablePreProxy: false,
             enableRemoteDebugging: false,
             enableUaWebglModify: false,
             closeBehavior: CLOSE_BEHAVIOR.TRAY,
-            userExtensions: []
-        };
-    }
-    const settings = await fs.readJson(SETTINGS_FILE);
-    return normalizeSettingsSnapshot(settings);
+            userExtensions: [],
+            defaultBookmarks: [],
+            defaultBookmarkScope: { mode: 'all', tags: [] }
+            })
+    };
 });
-ipcMain.handle('save-settings', async (e, settings) => {
+ipcMain.handle('save-settings', (e, settings) => runProfileApiTask(async () => {
     const incoming = (settings && typeof settings === 'object')
         ? JSON.parse(JSON.stringify(settings))
         : {};
     const existing = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : {};
+    const hasDefaultPasswords = Object.prototype.hasOwnProperty.call(incoming, 'defaultPasswords');
+    const requestedDefaultPasswords = hasDefaultPasswords ? incoming.defaultPasswords : null;
+    delete incoming.defaultPasswords;
+    if (hasDefaultPasswords) {
+        const defaultPasswordSettings = await writeDefaultPasswordSettings(
+            requestedDefaultPasswords,
+            incoming.defaultPasswordScope || existing.defaultPasswordScope
+        );
+        incoming.defaultPasswordScope = defaultPasswordSettings.scope;
+    }
     const merged = { ...(existing || {}), ...(incoming || {}) };
+    delete merged.defaultPasswords;
     await saveSettingsWithNormalizedExtensions(merged);
+    configSync?.schedule();
     refreshTrayMenu().catch(() => { });
     return true;
-});
+}));
 ipcMain.handle('select-extension-folder', async () => {
     const { filePaths } = await dialog.showOpenDialog({
         properties: ['openDirectory'],
@@ -4242,8 +4895,6 @@ ipcMain.handle('add-user-extension', async (e, payload) => {
                 const extracted = await extractCrxToDirectory(crxPath, outputDir);
                 sendProgress(80, '正在优化扩展安装行为...');
                 await patchExtensionInstallBehavior(outputDir).catch(() => { });
-                sendProgress(82, '正在优化扩展首次启动体验...');
-                await patchKnownExtensionOnboarding(outputDir, storeId).catch(() => { });
                 sendProgress(90, '扩展解析完成');
                 installed = {
                     id: `store_${storeId}`,
@@ -4287,7 +4938,7 @@ ipcMain.handle('add-user-extension', async (e, payload) => {
         }
 
         settings.userExtensions = normalizeUserExtensions(extensions);
-        await saveSettingsWithNormalizedExtensions(settings);
+        await saveExtensionSettings(settings.userExtensions);
         sendProgress(100, '扩展安装完成', true);
         return installed;
     } catch (err) {
@@ -4311,7 +4962,7 @@ ipcMain.handle('update-user-extension-scope', async (e, payload) => {
         applyMode,
         profileIds
     };
-    await saveSettingsWithNormalizedExtensions(settings);
+    await saveExtensionSettings(settings.userExtensions);
     return settings.userExtensions[idx];
 });
 ipcMain.handle('remove-user-extension', async (e, payload) => {
@@ -4329,7 +4980,7 @@ ipcMain.handle('remove-user-extension', async (e, payload) => {
     if (!matched) return true;
 
     settings.userExtensions = settings.userExtensions.filter(ext => ext.id !== matched.id);
-    await saveSettingsWithNormalizedExtensions(settings);
+    await saveExtensionSettings(settings.userExtensions);
 
     if ((matched.source === 'crx' || matched.source === 'store') && matched.path.startsWith(USER_EXTENSIONS_DIR)) {
         await fs.remove(matched.path).catch(() => { });
@@ -4383,6 +5034,7 @@ ipcMain.handle('set-data-directory', async (e, { newPath, migrate }) => {
         if (migrate && DATA_PATH !== newPath) {
             const oldProfiles = path.join(DATA_PATH, 'profiles.json');
             const oldSettings = path.join(DATA_PATH, 'settings.json');
+            const oldDefaultPasswords = path.join(DATA_PATH, 'default-passwords.json');
 
             // 迁移 profiles.json
             if (fs.existsSync(oldProfiles)) {
@@ -4391,6 +5043,9 @@ ipcMain.handle('set-data-directory', async (e, { newPath, migrate }) => {
             // 迁移 settings.json
             if (fs.existsSync(oldSettings)) {
                 await fs.copy(oldSettings, path.join(newPath, 'settings.json'));
+            }
+            if (fs.existsSync(oldDefaultPasswords)) {
+                await fs.copy(oldDefaultPasswords, path.join(newPath, 'default-passwords.json'));
             }
 
             // 迁移所有环境数据目录
@@ -4505,21 +5160,26 @@ function decryptData(encryptedBuffer, password) {
 }
 
 // --- 密码加密存储辅助函数 ---
-async function readEncryptedPasswords(pwFile, profileId) {
+async function readEncryptedPasswords(pwFile, profileId, { strict = false } = {}) {
     if (!fs.existsSync(pwFile)) return [];
     try {
         const encrypted = await fs.readFile(pwFile);
         const decrypted = decryptData(encrypted, 'GeekEZ_PW_' + profileId);
-        return JSON.parse(decrypted.toString('utf8'));
+        const passwords = JSON.parse(decrypted.toString('utf8'));
+        if (!Array.isArray(passwords) || passwords.some(entry => !entry || typeof entry !== 'object' || Array.isArray(entry))) {
+            throw new Error('Invalid password store');
+        }
+        return passwords;
     } catch (e) {
         try {
             // 兼容之前明文保存的 JSON，透明升级到加密
             const plain = await fs.readJson(pwFile);
-            if (Array.isArray(plain)) {
-                writeEncryptedPasswords(pwFile, plain, profileId).catch(() => { });
+            if (Array.isArray(plain) && plain.every(entry => entry && typeof entry === 'object' && !Array.isArray(entry))) {
+                if (!strict) writeEncryptedPasswords(pwFile, plain, profileId).catch(() => { });
                 return plain;
             }
         } catch (e2) { }
+        if (strict) throw new Error('密码库读取失败，未覆盖已有文件');
     }
     return [];
 }
@@ -4528,6 +5188,23 @@ async function writeEncryptedPasswords(pwFile, passwords, profileId) {
     const data = Buffer.from(JSON.stringify(passwords), 'utf8');
     const encrypted = encryptData(data, 'GeekEZ_PW_' + profileId);
     await fs.writeFile(pwFile, encrypted);
+}
+
+async function readPasskeyStore(profileId) {
+    const file = path.join(DATA_PATH, profileId, 'passkeys.json');
+    if (!fs.existsSync(file)) return { version: 1, enabled: false, credentials: [] };
+    try {
+        const encrypted = await fs.readFile(file);
+        return normalizePasskeyStore(JSON.parse(decryptData(encrypted, 'GeekEZ_PK_' + profileId).toString('utf8')));
+    } catch {
+        throw new Error('环境 Passkey 库读取失败，未覆盖已有文件');
+    }
+}
+
+async function writePasskeyStore(profileId, store) {
+    const normalized = normalizePasskeyStore(store);
+    const data = encryptData(Buffer.from(JSON.stringify(normalized)), 'GeekEZ_PK_' + profileId);
+    await commitProfileFiles([{ file: path.join(DATA_PATH, profileId, 'passkeys.json'), data }]);
 }
 
 // 获取用于选择器的环境列表
@@ -4729,7 +5406,7 @@ ipcMain.handle('select-backup-file', async () => {
 });
 
 // 导入完整备份 (支持 v1 旧格式 + v2 跨平台格式)
-ipcMain.handle('import-full-backup', async (e, { filePath, password }) => {
+ipcMain.handle('import-full-backup', (e, { filePath, password }) => runProfileApiTask(async () => {
     currentImportProgress = { percent: 0, message: 'Reading File...', processing: true };
     try {
         if (!filePath) {
@@ -4862,6 +5539,7 @@ ipcMain.handle('import-full-backup', async (e, { filePath, password }) => {
             }
         }
 
+        notifyUIRefresh();
         return { success: true, count: importedCount };
     } catch (err) {
         console.error('Import full backup failed:', err);
@@ -4870,7 +5548,7 @@ ipcMain.handle('import-full-backup', async (e, { filePath, password }) => {
         }
         return { success: false, error: err.message };
     }
-});
+}));
 
 // 导入普通备份 (YAML)
 ipcMain.handle('import-data', async () => {
@@ -4880,55 +5558,58 @@ ipcMain.handle('import-data', async () => {
     });
 
     if (filePaths && filePaths.length > 0) {
-        try {
-            const content = await fs.readFile(filePaths[0], 'utf8');
-            const data = yaml.load(content);
-            let updated = false;
+        return runProfileApiTask(async () => {
+            try {
+                const content = await fs.readFile(filePaths[0], 'utf8');
+                const data = yaml.load(content);
+                let updated = false;
 
-            if (data.profiles || data.preProxies || data.subscriptions) {
-                if (Array.isArray(data.profiles)) {
-                    const currentProfiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
-                    data.profiles.forEach(p => {
-                        const idx = currentProfiles.findIndex(cp => cp.id === p.id);
-                        if (idx > -1) currentProfiles[idx] = p;
-                        else {
-                            if (!p.id) p.id = uuidv4();
-                            currentProfiles.push(p);
+                if (data.profiles || data.preProxies || data.subscriptions) {
+                    if (Array.isArray(data.profiles)) {
+                        const currentProfiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
+                        data.profiles.forEach(p => {
+                            const idx = currentProfiles.findIndex(cp => cp.id === p.id);
+                            if (idx > -1) currentProfiles[idx] = p;
+                            else {
+                                if (!p.id) p.id = uuidv4();
+                                currentProfiles.push(p);
+                            }
+                        });
+                        await fs.writeJson(PROFILES_FILE, currentProfiles);
+                        updated = true;
+                    }
+                    if (Array.isArray(data.preProxies) || Array.isArray(data.subscriptions)) {
+                        const currentSettings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : { preProxies: [], subscriptions: [] };
+                        if (data.preProxies) {
+                            if (!currentSettings.preProxies) currentSettings.preProxies = [];
+                            data.preProxies.forEach(p => {
+                                if (!currentSettings.preProxies.find(cp => cp.id === p.id)) currentSettings.preProxies.push(p);
+                            });
                         }
-                    });
-                    await fs.writeJson(PROFILES_FILE, currentProfiles);
+                        if (data.subscriptions) {
+                            if (!currentSettings.subscriptions) currentSettings.subscriptions = [];
+                            data.subscriptions.forEach(s => {
+                                if (!currentSettings.subscriptions.find(cs => cs.id === s.id)) currentSettings.subscriptions.push(s);
+                            });
+                        }
+                        await fs.writeJson(SETTINGS_FILE, currentSettings);
+                        updated = true;
+                    }
+                } else if (data.name && data.proxyStr && data.fingerprint) {
+                    // 单个环境导入
+                    const profiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
+                    const newProfile = { ...data, id: uuidv4(), isSetup: false, createdAt: Date.now() };
+                    profiles.push(newProfile);
+                    await fs.writeJson(PROFILES_FILE, profiles);
                     updated = true;
                 }
-                if (Array.isArray(data.preProxies) || Array.isArray(data.subscriptions)) {
-                    const currentSettings = fs.existsSync(SETTINGS_FILE) ? await fs.readJson(SETTINGS_FILE) : { preProxies: [], subscriptions: [] };
-                    if (data.preProxies) {
-                        if (!currentSettings.preProxies) currentSettings.preProxies = [];
-                        data.preProxies.forEach(p => {
-                            if (!currentSettings.preProxies.find(cp => cp.id === p.id)) currentSettings.preProxies.push(p);
-                        });
-                    }
-                    if (data.subscriptions) {
-                        if (!currentSettings.subscriptions) currentSettings.subscriptions = [];
-                        data.subscriptions.forEach(s => {
-                            if (!currentSettings.subscriptions.find(cs => cs.id === s.id)) currentSettings.subscriptions.push(s);
-                        });
-                    }
-                    await fs.writeJson(SETTINGS_FILE, currentSettings);
-                    updated = true;
-                }
-            } else if (data.name && data.proxyStr && data.fingerprint) {
-                // 单个环境导入
-                const profiles = fs.existsSync(PROFILES_FILE) ? await fs.readJson(PROFILES_FILE) : [];
-                const newProfile = { ...data, id: uuidv4(), isSetup: false, createdAt: Date.now() };
-                profiles.push(newProfile);
-                await fs.writeJson(PROFILES_FILE, profiles);
-                updated = true;
+                if (updated) notifyUIRefresh();
+                return updated;
+            } catch (e) {
+                console.error(e);
+                throw e;
             }
-            return updated;
-        } catch (e) {
-            console.error(e);
-            throw e;
-        }
+        });
     }
     return false;
 });
@@ -4966,10 +5647,19 @@ ipcMain.handle('export-data', async (e, type) => {
 
 // --- 核心启动逻辑 ---
 const launchProfileHandler = async (event, profileId, watermarkStyle, preferredLang, launchOptions = {}) => {
+    if (xrayUpdateInProgress) {
+        throw profileResourceError('Xray core is being updated; retry launching shortly', 409);
+    }
+    if (profileResourceWrites.has(profileId)) {
+        throw profileResourceError('Profile data is being updated; retry launching shortly', 409);
+    }
     const sender = event.sender;
+    const launchLanguage = preferredLang === 'en' || preferredLang === 'cn'
+        ? preferredLang
+        : resolveSettingsUiLanguage(readSettingsSync());
     const launchArgsOverride = normalizeLaunchOverrideArgs(launchOptions.launchArgsOverride || []);
-    const progressTitle = preferredLang === 'en' ? 'Launching Profile' : '正在启动环境';
-    const progressWarn = preferredLang === 'en'
+    const progressTitle = launchLanguage === 'en' ? 'Launching Profile' : '正在启动环境';
+    const progressWarn = launchLanguage === 'en'
         ? 'Please wait while the environment starts. Do not close the application.'
         : '环境启动中，请稍候，不要关闭软件。';
     const totalProgressSteps = 10;
@@ -5000,7 +5690,7 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
 
     if (activeProcesses[profileId]) {
         const proc = activeProcesses[profileId];
-        if (proc.browser && proc.browser.isConnected()) {
+        if (isBrowserConnected(proc.browser)) {
             try {
                 const targets = await proc.browser.targets();
                 const pageTarget = targets.find(t => t.type() === 'page');
@@ -5031,13 +5721,16 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
     }
 
     if (launchingProfiles.has(profileId)) {
-        return preferredLang === 'en' ? 'Profile is starting' : '环境启动中';
+        return launchLanguage === 'en' ? 'Profile is starting' : '环境启动中';
     }
 
+    if (profileResourceWrites.has(profileId)) {
+        throw profileResourceError('Profile data is being updated; retry launching shortly', 409);
+    }
     await markLaunching(true);
     updateLaunchProgress(
         5,
-        preferredLang === 'en' ? 'Loading profile settings...' : '正在读取环境配置...',
+        launchLanguage === 'en' ? 'Loading profile settings...' : '正在读取环境配置...',
         true,
         { step: 1 }
     );
@@ -5052,7 +5745,7 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
         mode: 'single',
         enablePreProxy: false
     }));
-    const uiLang = preferredLang === 'en' ? 'en' : (settings.lang === 'en' ? 'en' : 'cn');
+    const uiLang = launchLanguage;
 
     const profiles = await fs.readJson(PROFILES_FILE);
     const profileIndex = profiles.findIndex(p => p.id === profileId);
@@ -5064,16 +5757,21 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
     profile.fingerprint = normalizeFingerprint(profile.fingerprint || {});
     updateLaunchProgress(
         12,
-        preferredLang === 'en' ? 'Validating profile configuration...' : '正在校验环境配置...',
+        launchLanguage === 'en' ? 'Validating profile configuration...' : '正在校验环境配置...',
         true,
         { step: 2, profileName: progressProfileName }
     );
 
     // Auto-assign a stable remote debugging port when feature is enabled and no explicit port exists.
     if (settings.enableRemoteDebugging && !normalizeDebugPort(profile.debugPort)) {
-        profile.debugPort = await allocateDebugPortIfNeeded(settings, profiles, null);
-        profiles[profileIndex] = profile;
-        await fs.writeJson(PROFILES_FILE, profiles);
+        await runProfileApiTask(async () => {
+            const latest = await fs.readJson(PROFILES_FILE);
+            const entry = latest.find(item => item.id === profileId);
+            if (!entry) throw new Error('Profile not found');
+            profile.debugPort = await allocateDebugPortIfNeeded(settings, latest, entry.debugPort);
+            entry.debugPort = profile.debugPort;
+            await fs.writeJson(PROFILES_FILE, latest);
+        });
     }
 
     const useDirectNetwork = isDirectProxy(profile.proxyStr);
@@ -5114,7 +5812,7 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
 
         updateLaunchProgress(
             20,
-            preferredLang === 'en' ? 'Preparing browser workspace...' : '正在准备浏览器工作区...',
+            launchLanguage === 'en' ? 'Preparing browser workspace...' : '正在准备浏览器工作区...',
             true,
             { step: 3, profileName: progressProfileName }
         );
@@ -5130,6 +5828,11 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
             if (preferences.protection) delete preferences.protection;
             if (!preferences.profile) preferences.profile = {};
             preferences.profile.name = profile.name;
+            // Chromium on Windows otherwise opens only its crash-recovery
+            // prompt after an interrupted launch. Mark the previous session
+            // clean before requesting last-session restoration.
+            preferences.profile.exit_type = 'Normal';
+            preferences.profile.exited_cleanly = true;
             if (!preferences.webrtc) preferences.webrtc = {};
             preferences.webrtc.ip_handling_policy = 'disable_non_proxied_udp';
             await fs.writeJson(preferencesPath, preferences);
@@ -5137,25 +5840,21 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
 
         const shouldLaunchXray = (!useDirectNetwork) || !!activePreProxy;
         let xrayLogPath = null;
+        let xrayConfigPath = null;
         if (shouldLaunchXray) {
             updateLaunchProgress(
                 32,
                 activePreProxy
-                    ? (preferredLang === 'en' ? 'Starting proxy chain service...' : '正在启动代理链服务...')
-                    : (preferredLang === 'en' ? 'Starting profile proxy service...' : '正在启动环境代理服务...'),
+                    ? (launchLanguage === 'en' ? 'Starting proxy chain service...' : '正在启动代理链服务...')
+                    : (launchLanguage === 'en' ? 'Starting profile proxy service...' : '正在启动环境代理服务...'),
                 true,
                 { step: 4, profileName: progressProfileName }
             );
-            localPort = await getAvailablePort();
-            const xrayConfigPath = path.join(profileDir, 'config.json');
+            xrayConfigPath = path.join(profileDir, 'config.json');
             xrayLogPath = path.join(profileDir, 'xray_run.log');
             const upstreamProxy = useDirectNetwork ? activePreProxy?.url : profile.proxyStr;
             const chainedPreProxy = useDirectNetwork ? null : finalPreProxyConfig;
-            const config = generateXrayConfig(upstreamProxy, localPort, chainedPreProxy, profile.fingerprint);
-            fs.writeJsonSync(xrayConfigPath, config);
             logFd = fs.openSync(xrayLogPath, 'a');
-            const xrayLaunchStartedAt = Date.now();
-            xrayProcess = spawn(BIN_PATH, ['-c', xrayConfigPath], { cwd: BIN_DIR, env: { ...process.env, 'XRAY_LOCATION_ASSET': RESOURCES_BIN }, stdio: ['ignore', logFd, logFd], windowsHide: true });
             const preProxyLabel = activePreProxy?.remark || activePreProxy?.name || activePreProxy?.id || '';
             const preProxyCheckPromise = activePreProxy?.url
                 ? startPreProxyHealthCheck(activePreProxy.url)
@@ -5163,7 +5862,7 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
             const throwPreProxyCheckError = (preProxyCheck) => {
                 updateLaunchProgress(
                     56,
-                    preferredLang === 'en'
+                    launchLanguage === 'en'
                         ? `Checking pre-proxy node${preProxyLabel ? ` [${preProxyLabel}]` : ''}...`
                         : `正在检测前置代理节点${preProxyLabel ? ` [${preProxyLabel}]` : ''}...`,
                     true,
@@ -5189,19 +5888,43 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
                 }
                 return first.value;
             };
-            updateLaunchProgress(
-                40,
-                preferredLang === 'en' ? 'Waiting for local proxy port...' : '正在等待本地代理端口就绪...',
-                true,
-                { step: 4, profileName: progressProfileName }
-            );
+            let xrayLaunchStartedAt = 0;
             const readyTimeoutMs = 2500;
-            const ready = await awaitWithPreProxyPriority(waitForLocalPortReady(localPort, readyTimeoutMs));
-            if (!ready) {
+            const maxBindAttempts = 3;
+            for (let attempt = 1; attempt <= maxBindAttempts; attempt++) {
+                localPort = await allocateLocalProxyPort();
+                const config = generateXrayConfig(upstreamProxy, localPort, chainedPreProxy, profile.fingerprint);
+                fs.writeJsonSync(xrayConfigPath, config);
+                const logOffset = fs.fstatSync(logFd).size;
+                xrayLaunchStartedAt = Date.now();
+                xrayProcess = spawnXrayProcess(xrayConfigPath, logFd);
+
+                updateLaunchProgress(
+                    40,
+                    attempt === 1
+                        ? (launchLanguage === 'en' ? 'Waiting for local proxy port...' : '正在等待本地代理端口就绪...')
+                        : (launchLanguage === 'en' ? 'Retrying local proxy port...' : '正在重新分配本地代理端口...'),
+                    true,
+                    { step: 4, profileName: progressProfileName }
+                );
+                const ready = await awaitWithPreProxyPriority(waitForLocalPortReady(localPort, readyTimeoutMs));
+                if (ready) {
+                    await sleep(100);
+                    if (xrayProcess.exitCode === null) break;
+                }
+
                 const exitCode = xrayProcess.exitCode;
                 const reason = exitCode !== null
                     ? `xray exited before ready (code: ${exitCode})`
                     : `xray socks port ${localPort} not ready within ${readyTimeoutMs}ms`;
+                const attemptLog = readFileSinceSafe(xrayLogPath, logOffset);
+                if (attempt < maxBindAttempts && isXrayLocalBindFailure(attemptLog, localPort)) {
+                    console.warn(`[Xray Launch Retry] local port ${localPort} bind failed; allocating another TCP/UDP port`);
+                    await forceKill(xrayProcess.pid);
+                    xrayProcess = null;
+                    await sleep(150);
+                    continue;
+                }
                 throw createProxyStartupError(profile.name, reason, xrayLogPath, uiLang);
             }
 
@@ -5216,8 +5939,8 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
             updateLaunchProgress(
                 48,
                 activePreProxy
-                    ? (preferredLang === 'en' ? 'Checking proxy chain availability...' : '正在检测代理链可用性...')
-                    : (preferredLang === 'en' ? 'Checking profile proxy availability...' : '正在检测环境代理可用性...'),
+                    ? (launchLanguage === 'en' ? 'Checking proxy chain availability...' : '正在检测代理链可用性...')
+                    : (launchLanguage === 'en' ? 'Checking profile proxy availability...' : '正在检测环境代理可用性...'),
                 true,
                 { step: 5, profileName: progressProfileName }
             );
@@ -5245,7 +5968,7 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
                 if (activePreProxy?.url) {
                     updateLaunchProgress(
                         56,
-                        preferredLang === 'en'
+                        launchLanguage === 'en'
                             ? `Checking pre-proxy node${preProxyLabel ? ` [${preProxyLabel}]` : ''}...`
                             : `正在检测前置代理节点${preProxyLabel ? ` [${preProxyLabel}]` : ''}...`,
                         true,
@@ -5269,21 +5992,44 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
         } else {
             updateLaunchProgress(
                 48,
-                preferredLang === 'en' ? 'Using direct network path...' : '正在使用直连网络...',
+                launchLanguage === 'en' ? 'Using direct network path...' : '正在使用直连网络...',
                 true,
                 { step: 5, profileName: progressProfileName }
             );
         }
 
+        const autoIpBasePolicy = getAutoIpBasePolicy(profile.fingerprint);
+        if (autoIpBasePolicy.enabled) {
+            updateLaunchProgress(
+                58,
+                launchLanguage === 'en' ? 'Resolving IP-based fingerprint...' : '正在解析基于 IP 的指纹...',
+                true,
+                { step: 6, profileName: progressProfileName }
+            );
+            try {
+                const resolved = await resolveAutoIpBaseFingerprint(profileId, profile.fingerprint, localPort);
+                if (resolved && resolved.fingerprint) {
+                    profile.fingerprint = resolved.fingerprint;
+                    logAutoIpBaseResolution(profile.name, profileId, resolved);
+                }
+            } catch (err) {
+                console.warn(`[Auto IP Base] ${profile.name || profileId}: ${err?.message || err}`);
+            }
+        }
+
         updateLaunchProgress(
             66,
-            preferredLang === 'en' ? 'Preparing fingerprint parameters...' : '正在准备指纹参数...',
+            launchLanguage === 'en' ? 'Preparing fingerprint parameters...' : '正在准备指纹参数...',
             true,
             { step: 6, profileName: progressProfileName }
         );
         // 0. Resolve language override
         const configuredLang = profile.fingerprint?.language;
-        const hasLanguageOverride = typeof configuredLang === 'string' && configuredLang && !isAutoLanguageValue(configuredLang);
+        const leaveLanguageUnmodified = isNoOverrideValue(configuredLang);
+        const hasLanguageOverride = typeof configuredLang === 'string' &&
+            configuredLang &&
+            !isAutoLanguageValue(configuredLang) &&
+            !leaveLanguageUnmodified;
         const localeFromSystem = (() => {
             try {
                 const rawLocale = app.getLocale ? app.getLocale() : '';
@@ -5303,26 +6049,28 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
             profile.fingerprint.language = targetLang;
             profile.fingerprint.languages = [targetLang, targetLang.split('-')[0]];
         } else {
-            profile.fingerprint.language = 'auto';
+            profile.fingerprint.language = leaveLanguageUnmodified ? 'none' : 'auto';
             profile.fingerprint.languages = [];
         }
 
         // 1. 生成 GeekEZ Guard 扩展（使用传递的水印样式）
         const style = watermarkStyle === 'banner' || watermarkStyle === 'off' ? watermarkStyle : 'enhanced';
+        await passkeyRuntimes.get(profileId)?.manager?.flush();
+        await passkeyRuntimes.get(profileId)?.manager?.close();
+        await readPasskeyStore(profileId);
+        passkeyRuntimes.set(profileId, { token: createApiToken(), manager: null });
         const extPath = await generateExtension(profileDir, profile.fingerprint, profile.name, style, profileId);
 
         // 2. 获取当前环境需要加载的用户扩展
         updateLaunchProgress(
             76,
-            preferredLang === 'en' ? 'Loading browser extensions...' : '正在加载浏览器扩展...',
+            launchLanguage === 'en' ? 'Loading browser extensions...' : '正在加载浏览器扩展...',
             true,
             { step: 7, profileName: progressProfileName }
         );
         const userExtensions = getProfileUserExtensions(settings, profileId);
         for (const ext of userExtensions) {
             await patchExtensionInstallBehavior(ext.path).catch(() => { });
-            const extStoreId = sanitizeExtensionStoreId(ext.storeId) || sanitizeExtensionStoreId(String(ext.id || '').replace(/^store_/, ''));
-            await patchKnownExtensionOnboarding(ext.path, extStoreId).catch(() => { });
         }
         const userExtPaths = userExtensions.map(ext => ext.path);
 
@@ -5342,9 +6090,13 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
             disabledFeatures.push('StartupLaunch', 'StartupBoost');
         }
 
+        const uaSpoofEnabled = String(profile.fingerprint?.uaMode || 'none').toLowerCase() !== 'none';
+        const launchWindow = profile.fingerprint?.window || { width: 1280, height: 800 };
+
         const launchArgs = [
             `--user-data-dir=${userDataDir}`,
-            `--window-size=${profile.fingerprint?.window?.width || 1280},${profile.fingerprint?.window?.height || 800}`,
+            '--disable-save-password-bubble',
+            `--window-size=${launchWindow.width || 1280},${launchWindow.height || 800}`,
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-blink-features=AutomationControlled',
@@ -5373,12 +6125,13 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
             launchArgs.unshift('--no-proxy-server');
         }
 
-        if (profile.fingerprint?.userAgent) {
+        if (uaSpoofEnabled && profile.fingerprint?.userAgent) {
             launchArgs.push(`--user-agent=${profile.fingerprint.userAgent}`);
         }
         if (hasLanguageOverride) {
             launchArgs.push(`--lang=${targetLang}`);
-            launchArgs.push(`--accept-lang=${targetLang}`);
+            const launchLanguages = normalizeLanguageList(targetLang, profile.fingerprint?.languages);
+            launchArgs.push(`--accept-lang=${launchLanguages.join(',') || targetLang}`);
         }
 
         // 5. Remote Debugging Port (if enabled)
@@ -5411,7 +6164,7 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
             console.log('⚡ API Launch Args Override:', launchArgsOverride.join(' '));
             updateLaunchProgress(
                 84,
-                preferredLang === 'en'
+                launchLanguage === 'en'
                     ? `Applying temporary launch args: ${launchArgsOverride.join(' ')}`
                     : `正在应用本次临时启动参数：${launchArgsOverride.join(' ')}`,
                 true,
@@ -5421,7 +6174,7 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
 
         updateLaunchProgress(
             86,
-            preferredLang === 'en' ? 'Launching browser window...' : '正在启动浏览器窗口...',
+            launchLanguage === 'en' ? 'Launching browser window...' : '正在启动浏览器窗口...',
             true,
             { step: 8, profileName: progressProfileName }
         );
@@ -5434,9 +6187,15 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
             throw new Error("Chrome binary not found.");
         }
 
+        // GeekEZ Guard owns credential capture and autofill. Disable only the
+        // Chromium UI prompt so it cannot cover pages during automation.
+        disableNativePasswordManager(userDataDir);
+
         // 时区设置
         const env = { ...process.env };
-        if (profile.fingerprint?.timezone && !isAutoTimezoneValue(profile.fingerprint.timezone)) {
+        if (profile.fingerprint?.timezone &&
+            !isAutoTimezoneValue(profile.fingerprint.timezone) &&
+            !isNoOverrideValue(profile.fingerprint.timezone)) {
             env.TZ = profile.fingerprint.timezone;
         }
 
@@ -5454,300 +6213,138 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
 
         updateLaunchProgress(
             94,
-            preferredLang === 'en' ? 'Applying runtime settings...' : '正在应用运行时设置...',
+            launchLanguage === 'en' ? 'Applying runtime settings...' : '正在应用运行时设置...',
             true,
             { step: 9, profileName: progressProfileName }
         );
+
+        await installWorkerFingerprint(browser, profile.fingerprint, isGoogleAuthLikeUrl);
 
         let runtimeFingerprint = profile.fingerprint;
         setProfileRuntimeLanguageState(profileId, runtimeFingerprint);
         const getRuntimeLanguageState = () => {
             return buildRuntimeLanguageState(runtimeFingerprint);
         };
-        let geolocationScript = getGeolocationScript(runtimeFingerprint);
-        let fingerprintInjectScript = getInjectScript(runtimeFingerprint, profile.name, style);
-        const watermarkInjectScript = getWatermarkScript(profile.name, style);
-        let earlyAttachSession = null;
-        const earlyAttachSessions = new Set();
-        const enableWebglOverride = !!(
-            profile.fingerprint?.webglProfile !== 'none' &&
-            profile.fingerprint?.webgl &&
-            !profile.fingerprint?.webgl?.disabled
-        );
-        const webglOverrideScript = (() => {
-            if (!enableWebglOverride) return '(()=>{})();';
-            const webglJson = JSON.stringify(profile.fingerprint?.webgl || {});
-            return `
-(() => {
-  try {
-    const webglInfo = ${webglJson};
-    const PATCHED_KEY = '__geekezDirectWebglPatched__';
-    const debugExt = { UNMASKED_VENDOR_WEBGL: 37445, UNMASKED_RENDERER_WEBGL: 37446 };
 
-    const caps = (() => {
-      const renderer = String(webglInfo.unmaskedRenderer || webglInfo.renderer || '').toLowerCase();
-      const vendor = String(webglInfo.unmaskedVendor || webglInfo.vendor || '').toLowerCase();
-      const isHigh = renderer.includes('apple') || renderer.includes('nvidia') || renderer.includes('amd') || renderer.includes('radeon') || vendor.includes('apple') || vendor.includes('nvidia') || vendor.includes('ati');
-      const texture = isHigh ? 32768 : 16384;
-      const vertexUniforms = isHigh ? 4096 : 2048;
-      const fragmentUniforms = isHigh ? 2048 : 1024;
-      const varying = isHigh ? 32 : 30;
-      return {
-        3379: texture,
-        34076: texture,
-        34024: texture,
-        34921: 16,
-        34930: 16,
-        35660: 16,
-        35661: 32,
-        36347: vertexUniforms,
-        36348: varying,
-        36349: fragmentUniforms,
-        3386: new Int32Array([texture, texture]),
-        33901: new Float32Array([1, 1024]),
-        33902: new Float32Array([1, 1]),
-        34852: 8,
-        36063: 8
-      };
-    })();
-
-    const cloneCap = (value) => {
-      if (value instanceof Int32Array) return new Int32Array(value);
-      if (value instanceof Float32Array) return new Float32Array(value);
-      return value;
-    };
-
-    const patchProto = (proto) => {
-      if (!proto || proto[PATCHED_KEY]) return;
-      try {
-        const originalGetParameter = proto.getParameter;
-        const originalGetExtension = proto.getExtension;
-        const originalGetSupportedExtensions = proto.getSupportedExtensions;
-        proto.getParameter = function(param) {
-          if (param === 37445) return webglInfo.unmaskedVendor || webglInfo.vendor || 'Google Inc.';
-          if (param === 37446) return webglInfo.unmaskedRenderer || webglInfo.renderer || 'ANGLE (Unknown GPU)';
-          if (param === 7936) return webglInfo.vendor || 'Google Inc.';
-          if (param === 7937) return webglInfo.renderer || 'ANGLE (Unknown GPU)';
-          if (param === 7938) return webglInfo.version || 'WebGL 1.0 (OpenGL ES 2.0 Chromium)';
-          if (param === 35724) return webglInfo.shadingLanguageVersion || 'WebGL GLSL ES 1.0 (OpenGL ES GLSL ES 1.0 Chromium)';
-          if (Object.prototype.hasOwnProperty.call(caps, param)) return cloneCap(caps[param]);
-          return originalGetParameter.apply(this, arguments);
-        };
-        proto.getExtension = function(name) {
-          if (name === 'WEBGL_debug_renderer_info') return debugExt;
-          return originalGetExtension.apply(this, arguments);
-        };
-        if (originalGetSupportedExtensions) {
-          proto.getSupportedExtensions = function() {
-            const list = originalGetSupportedExtensions.apply(this, arguments) || [];
-            if (Array.isArray(list) && !list.includes('WEBGL_debug_renderer_info')) return list.concat(['WEBGL_debug_renderer_info']);
-            return list;
-          };
-        }
-        Object.defineProperty(proto, PATCHED_KEY, { value: true, configurable: true });
-      } catch (e) {}
-    };
-
-    const patchFactory = (factoryProto) => {
-      if (!factoryProto || !factoryProto.getContext || factoryProto.__geekezCtxPatched__) return;
-      try {
-        const originalGetContext = factoryProto.getContext;
-        factoryProto.getContext = function(type) {
-          const ctx = originalGetContext.apply(this, arguments);
-          const name = String(type || '').toLowerCase();
-          if (name === 'webgl' || name === 'experimental-webgl' || name === 'webgl2') {
-            try { patchProto(Object.getPrototypeOf(ctx)); } catch (e) {}
-          }
-          return ctx;
-        };
-        Object.defineProperty(factoryProto, '__geekezCtxPatched__', { value: true, configurable: true });
-      } catch (e) {}
-    };
-
-    patchProto(window.WebGLRenderingContext && window.WebGLRenderingContext.prototype);
-    patchProto(window.WebGL2RenderingContext && window.WebGL2RenderingContext.prototype);
-    patchFactory(window.HTMLCanvasElement && window.HTMLCanvasElement.prototype);
-    patchFactory(window.OffscreenCanvas && window.OffscreenCanvas.prototype);
-  } catch (e) {}
-})();
-            `;
-        })();
-
-        // Keep network headers, Intl locale and runtime fingerprint hooks aligned with profile settings.
+        // GeekEZ Guard is the single source for page-world fingerprint hooks. CDP only
+        // aligns network headers, locale and timezone with the resolved profile.
         const applySessionOverrides = async (session, options = {}) => {
             if (!session) return;
-            const { includeScripts = false, resume = false } = options;
+            const { url = '' } = options;
+            const runtimeLanguage = getRuntimeLanguageState();
+            // Apply native locale/timezone overrides while the startup page is still
+            // blank. Deferring them until after navigation creates a detectable
+            // language transition during the first document load.
+            const googleAuthSafeMode = isGoogleAuthLikeUrl(url);
+            const hasTimezoneOverride = !!(
+                runtimeFingerprint?.timezone &&
+                !isAutoTimezoneValue(runtimeFingerprint.timezone) &&
+                !isNoOverrideValue(runtimeFingerprint.timezone)
+            );
 
-            try {
-                if (includeScripts) {
-                    try {
-                        await session.send('Page.enable');
-                        await session.send('Page.addScriptToEvaluateOnNewDocument', { source: geolocationScript });
-                        await session.send('Page.addScriptToEvaluateOnNewDocument', { source: fingerprintInjectScript });
-                        await session.send('Page.addScriptToEvaluateOnNewDocument', { source: watermarkInjectScript });
-                        await session.send('Page.addScriptToEvaluateOnNewDocument', { source: webglOverrideScript });
-                    } catch (e) { }
-                }
+            try { await session.send('Network.enable'); } catch (e) { }
 
-                try { await session.send('Network.enable'); } catch (e) { }
-
-                const runtimeLanguage = getRuntimeLanguageState();
+            if (googleAuthSafeMode) {
                 if (runtimeLanguage.enabled) {
                     try {
-                        await session.send('Network.setExtraHTTPHeaders', {
-                            headers: {
-                                'Accept-Language': runtimeLanguage.acceptLanguageHeader
-                            }
-                        });
+                        await session.send('Network.setExtraHTTPHeaders', { headers: {} });
                     } catch (e) { }
-
                     try {
-                        await session.send('Emulation.setLocaleOverride', { locale: runtimeLanguage.language });
+                        await session.send('Emulation.setLocaleOverride', { locale: '' });
                     } catch (e) { }
                 }
-
-                if (runtimeFingerprint?.timezone && !isAutoTimezoneValue(runtimeFingerprint.timezone)) {
+                if (hasTimezoneOverride) {
                     try {
-                        await session.send('Emulation.setTimezoneOverride', { timezoneId: runtimeFingerprint.timezone });
+                        await session.send('Emulation.setTimezoneOverride', { timezoneId: '' });
                     } catch (e) { }
                 }
-
-                if (profile.fingerprint?.userAgent) {
-                    const payload = {
-                        userAgent: profile.fingerprint.userAgent
-                    };
-                    if (runtimeLanguage.enabled) {
-                        payload.acceptLanguage = runtimeLanguage.acceptLanguageHeader;
-                    }
-                    if (profile.fingerprint?.platform) {
-                        payload.platform = profile.fingerprint.platform;
-                    }
-
-                    const metadata = profile.fingerprint?.userAgentMetadata;
-                    if (metadata && typeof metadata === 'object') {
-                        const md = {
-                            mobile: !!metadata.mobile
-                        };
-                        if (Array.isArray(metadata.brands)) md.brands = metadata.brands;
-                        if (Array.isArray(metadata.fullVersionList)) md.fullVersionList = metadata.fullVersionList;
-                        if (metadata.platform) md.platform = metadata.platform;
-                        if (metadata.platformVersion) md.platformVersion = metadata.platformVersion;
-                        if (metadata.architecture) md.architecture = metadata.architecture;
-                        if (metadata.model !== undefined) md.model = metadata.model;
-                        if (metadata.bitness) md.bitness = metadata.bitness;
-                        if (metadata.wow64 !== undefined) md.wow64 = !!metadata.wow64;
-                        if (metadata.uaFullVersion) md.fullVersion = metadata.uaFullVersion;
-                        payload.userAgentMetadata = md;
-                    }
-
-                    await session.send('Network.setUserAgentOverride', payload);
-                }
-            } finally {
-                if (resume) {
-                    try { await session.send('Runtime.runIfWaitingForDebugger'); } catch (e) { }
-                }
-            }
-        };
-
-        const installEarlyTargetOverrides = async () => {
-            try {
-                if (!browser || typeof browser.target !== 'function') return;
-                const browserTarget = browser.target();
-                if (!browserTarget || typeof browserTarget.createCDPSession !== 'function') return;
-
-                earlyAttachSession = await browserTarget.createCDPSession();
-                earlyAttachSession.on('Target.attachedToTarget', async (event = {}) => {
-                    const targetInfo = event.targetInfo || {};
-                    const sessionId = event.sessionId;
-                    if (targetInfo.type !== 'page' || !sessionId) return;
-
-                    let childSession = null;
-                    try {
-                        const connection = typeof earlyAttachSession.connection === 'function'
-                            ? earlyAttachSession.connection()
-                            : null;
-                        childSession = connection && typeof connection.session === 'function'
-                            ? connection.session(sessionId)
-                            : null;
-                        if (!childSession) return;
-
-                        earlyAttachSessions.add(childSession);
-                        await applySessionOverrides(childSession, {
-                            includeScripts: true,
-                            resume: true
-                        });
-                    } catch (err) {
-                        try {
-                            if (childSession) await childSession.send('Runtime.runIfWaitingForDebugger');
-                        } catch (e) { }
-                    }
-                });
-
-                earlyAttachSession.on('Target.detachedFromTarget', (event = {}) => {
-                    const sessionId = event.sessionId;
-                    for (const session of Array.from(earlyAttachSessions)) {
-                        try {
-                            if (typeof session.id === 'function' && session.id() === sessionId) {
-                                earlyAttachSessions.delete(session);
-                            }
-                        } catch (e) { }
-                    }
-                });
-
-                await earlyAttachSession.send('Target.setAutoAttach', {
-                    autoAttach: true,
-                    waitForDebuggerOnStart: true,
-                    flatten: true,
-                    filter: [{ type: 'page' }]
-                });
-            } catch (err) {
-                console.warn('Early target override failed:', err?.message || err);
-            }
-        };
-
-        const refreshEarlyTargetOverrides = async () => {
-            for (const session of Array.from(earlyAttachSessions)) {
+            } else if (runtimeLanguage.enabled) {
                 try {
-                    if (session?.detached) {
-                        earlyAttachSessions.delete(session);
-                        continue;
-                    }
-                    await applySessionOverrides(session, { includeScripts: true });
+                    await session.send('Network.setExtraHTTPHeaders', {
+                        headers: {
+                            'Accept-Language': runtimeLanguage.acceptLanguageHeader
+                        }
+                    });
+                } catch (e) { }
+
+                try {
+                    await session.send('Emulation.setLocaleOverride', { locale: runtimeLanguage.language });
                 } catch (e) { }
             }
+
+            if (!googleAuthSafeMode && hasTimezoneOverride) {
+                try {
+                    await session.send('Emulation.setTimezoneOverride', { timezoneId: runtimeFingerprint.timezone });
+                } catch (e) { }
+            }
+
+            if (uaSpoofEnabled && profile.fingerprint?.userAgent) {
+                const payload = {
+                    userAgent: profile.fingerprint.userAgent
+                };
+                if (runtimeLanguage.enabled && !googleAuthSafeMode) {
+                    payload.acceptLanguage = runtimeLanguage.acceptLanguageOverride;
+                }
+                if (profile.fingerprint?.platform) {
+                    payload.platform = profile.fingerprint.platform;
+                }
+
+                const metadata = profile.fingerprint?.userAgentMetadata;
+                if (metadata && typeof metadata === 'object') {
+                    const md = {
+                        mobile: !!metadata.mobile
+                    };
+                    if (Array.isArray(metadata.brands)) md.brands = metadata.brands;
+                    if (Array.isArray(metadata.fullVersionList)) md.fullVersionList = metadata.fullVersionList;
+                    if (metadata.platform) md.platform = metadata.platform;
+                    if (metadata.platformVersion) md.platformVersion = metadata.platformVersion;
+                    if (metadata.architecture) md.architecture = metadata.architecture;
+                    if (metadata.model !== undefined) md.model = metadata.model;
+                    if (metadata.bitness) md.bitness = metadata.bitness;
+                    if (metadata.wow64 !== undefined) md.wow64 = !!metadata.wow64;
+                    if (metadata.uaFullVersion) md.fullVersion = metadata.uaFullVersion;
+                    payload.userAgentMetadata = md;
+                }
+
+                await session.send('Network.setUserAgentOverride', payload);
+            }
+        };
+
+        const pageOverrideSessions = new WeakMap();
+        const getPageOverrideSession = async (page) => {
+            let session = pageOverrideSessions.get(page);
+            if (!session) {
+                session = await page.createCDPSession();
+                pageOverrideSessions.set(page, session);
+            }
+            return session;
+        };
+
+        const applyPageRuntimeOverrides = async (page) => {
+            if (!page) return;
+            const session = await getPageOverrideSession(page);
+            await applySessionOverrides(session, {
+                url: typeof page.url === 'function' ? page.url() : ''
+            });
+        };
+
+        const runtimeOverrideWatchedPages = new WeakSet();
+        const watchPageRuntimeOverrideNavigation = (page) => {
+            if (!page || runtimeOverrideWatchedPages.has(page) || typeof page.on !== 'function') return;
+            runtimeOverrideWatchedPages.add(page);
+            page.on('framenavigated', async (frame) => {
+                try {
+                    if (typeof page.mainFrame === 'function' && frame !== page.mainFrame()) return;
+                    await applyPageRuntimeOverrides(page, false);
+                } catch (e) { }
+            });
         };
 
         const applyPageOverrides = async (page) => {
             if (!page) return;
             try {
-                try {
-                    await page.evaluateOnNewDocument(geolocationScript);
-                } catch (e) { }
-                try {
-                    await page.evaluateOnNewDocument(fingerprintInjectScript);
-                } catch (e) { }
-                try {
-                    await page.evaluateOnNewDocument(watermarkInjectScript);
-                } catch (e) { }
-                try {
-                    await page.evaluateOnNewDocument(webglOverrideScript);
-                } catch (e) { }
-
-                try {
-                    await page.evaluate(geolocationScript);
-                } catch (e) { }
-                try {
-                    await page.evaluate(fingerprintInjectScript);
-                } catch (e) { }
-                try {
-                    await page.evaluate(watermarkInjectScript);
-                } catch (e) { }
-                try {
-                    await page.evaluate(webglOverrideScript);
-                } catch (e) { }
-
-                const session = await page.createCDPSession();
-                await applySessionOverrides(session, { includeScripts: true });
+                watchPageRuntimeOverrideNavigation(page);
+                await applyPageRuntimeOverrides(page);
             } catch (err) {
                 const msg = String(err && err.message ? err.message : '');
                 if (msg.includes('No target with given id found') || msg.includes('Target closed')) {
@@ -5756,8 +6353,6 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
                 console.warn('Page override failed:', msg);
             }
         };
-
-        await installEarlyTargetOverrides();
 
         try {
             const startupPages = await browser.pages();
@@ -5840,19 +6435,38 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
             }, 500);
 
             await ensureAtLeastOnePage();
+            const firstPage = (await browser.pages())[0];
+            if (firstPage) {
+                await ensureBrowserWindowVisible(firstPage, { nudge: process.platform === 'win32' });
+                await firstPage.bringToFront().catch(() => { });
+            }
         } catch (e) {
             console.error('Failed to process startup pages:', e);
         }
 
+        const passkeyRuntime = passkeyRuntimes.get(profileId);
+        passkeyRuntime.manager = await createPasskeyManager({
+            browser,
+            readStore: () => readPasskeyStore(profileId),
+            writeStore: store => writePasskeyStore(profileId, store),
+            onChange: () => configSync?.schedule()
+        });
+
         activeProcesses[profileId] = {
             xrayPid: xrayProcess ? xrayProcess.pid : null,
+            xrayProcess,
+            xrayConfigPath,
+            localPort,
             browser,
-            logFd: logFd  // 存储日志文件描述符，用于后续关闭
+            logFd,
+            recoveringProxy: false,
+            stopping: false
         };
+        if (xrayProcess) attachXrayExitRecovery(profileId, xrayProcess);
         launchingProfiles.delete(profileId);
         updateLaunchProgress(
             100,
-            preferredLang === 'en' ? 'Launch complete' : '启动完成',
+            launchLanguage === 'en' ? 'Launch complete' : '启动完成',
             true,
             { step: 10, profileName: progressProfileName }
         );
@@ -5860,54 +6474,16 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
         sender.send('profile-status', { id: profileId, status: 'running' });
         refreshTrayMenu().catch(() => { });
 
-        const applyAutoIpBaseRuntime = async () => {
-            const policy = getAutoIpBasePolicy(profile.fingerprint);
-            if (!policy.enabled) return;
-            try {
-                const resolved = await resolveAutoIpBaseFingerprintAfterLaunch(profileId, profile.fingerprint, localPort);
-                if (!resolved || !resolved.fingerprint) return;
-
-                runtimeFingerprint = resolved.fingerprint;
-                setProfileRuntimeLanguageState(profileId, runtimeFingerprint);
-                geolocationScript = getGeolocationScript(runtimeFingerprint);
-                fingerprintInjectScript = getInjectScript(runtimeFingerprint, profile.name, style);
-
-                try {
-                    await refreshEarlyTargetOverrides();
-                    const pages = await browser.pages();
-                    for (const page of pages) {
-                        await applyPageOverrides(page);
-                    }
-                } catch (e) { }
-
-                const parts = [];
-                if (resolved.policy.location && hasValidGeolocation(runtimeFingerprint.geolocation)) {
-                    parts.push(`geo=${runtimeFingerprint.geolocation.latitude},${runtimeFingerprint.geolocation.longitude}`);
-                }
-                if (resolved.policy.timezone && isValidTimezoneId(runtimeFingerprint.timezone)) {
-                    parts.push(`timezone=${runtimeFingerprint.timezone}`);
-                }
-                if (resolved.policy.language && canonicalizeLocale(runtimeFingerprint.language)) {
-                    parts.push(`language=${runtimeFingerprint.language}`);
-                }
-                console.log(`[Auto IP Base] ${profile.name || profileId}: ${resolved.cacheHit ? 'reused cache' : 'refreshed'} ip=${resolved.source.ip}${parts.length ? ` ${parts.join(' ')}` : ''}`);
-            } catch (err) {
-                console.warn(`[Auto IP Base] ${profile.name || profileId}: ${err?.message || err}`);
-            }
-        };
-        setTimeout(() => {
-            applyAutoIpBaseRuntime().catch((err) => {
-                console.warn(`[Auto IP Base] ${profile.name || profileId}: ${err?.message || err}`);
-            });
-        }, 0);
-
         // CDP Timezone Override (Windows only)
         // On macOS/Linux, TZ env var changes V8's timezone natively.
         // On Windows, V8 ignores TZ and uses Win32 API, so we use CDP instead.
         // This changes V8's internal timezone at the engine level - all Date methods
         // (toString, getTimezoneOffset, getHours, etc.) and Intl APIs work correctly.
         const targetTimezone = runtimeFingerprint?.timezone;
-        if (process.platform === 'win32' && targetTimezone && !isAutoTimezoneValue(targetTimezone)) {
+        if (process.platform === 'win32' &&
+            targetTimezone &&
+            !isAutoTimezoneValue(targetTimezone) &&
+            !isNoOverrideValue(targetTimezone)) {
             try {
                 const pages = await browser.pages();
                 for (const page of pages) {
@@ -5927,12 +6503,19 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
         }
 
         browser.on('disconnected', async () => {
-            if (activeProcesses[profileId]) {
-                const pid = activeProcesses[profileId].xrayPid;
-                const logFd = activeProcesses[profileId].logFd;
-
-                try { await earlyAttachSession?.detach(); } catch (e) { }
-                earlyAttachSessions.clear();
+            try {
+                await passkeyRuntime.manager?.close();
+                if (passkeyRuntimes.get(profileId) === passkeyRuntime) passkeyRuntimes.delete(profileId);
+            } catch (failure) {
+                passkeyRuntime.storageError = true;
+                passkeyRuntime.apiRevoked = true;
+                void dialog.showMessageBox({ type: 'error', title: 'GeekEZ Guard', message: '环境 Passkey 数据保存失败，请勿切换终端', detail: '待保存数据仍保留在当前主体内存中，请修复磁盘问题后重新启动环境。' });
+            }
+            if (activeProcesses[profileId]?.browser === browser) {
+                const proc = activeProcesses[profileId];
+                proc.stopping = true;
+                const pid = proc.xrayPid;
+                const logFd = proc.logFd;
 
                 // 关闭日志文件描述符
                 if (logFd !== undefined) {
@@ -5962,6 +6545,11 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
 
         return switchMsg;
     } catch (err) {
+        const runtime = passkeyRuntimes.get(profileId);
+        if (!runtime?.storageError) {
+            await runtime?.manager?.close().catch(() => {});
+            passkeyRuntimes.delete(profileId);
+        }
         try {
             if (browser) await browser.close();
         } catch (e) { }
@@ -5991,8 +6579,36 @@ const launchProfileHandler = async (event, profileId, watermarkStyle, preferredL
 };
 ipcMain.handle('launch-profile', launchProfileHandler);
 
-app.on('before-quit', () => {
+let drainingPasskeys = false;
+app.on('before-quit', event => {
     isAppQuitting = true;
+    if (passkeyRuntimes.size) {
+        event.preventDefault();
+        if (launchingProfiles.size) {
+            isAppQuitting = false;
+            void dialog.showMessageBox({ type: 'info', title: 'GeekEZ Guard', message: '环境仍在启动，请等待启动完成后再退出' });
+            return;
+        }
+        if (drainingPasskeys) return;
+        drainingPasskeys = true;
+        void stopAllRunningProfilesFromTray().then(async () => {
+            for (const [id, runtime] of passkeyRuntimes) {
+                await runtime.manager?.flush();
+                await runtime.manager?.close();
+                passkeyRuntimes.delete(id);
+            }
+            drainingPasskeys = false;
+            app.quit();
+        }).catch(async failure => {
+            drainingPasskeys = false;
+            isAppQuitting = false;
+            await dialog.showMessageBox({ type: 'error', title: 'GeekEZ Guard', message: 'Passkey 数据尚未安全保存，已取消退出', detail: failure.message });
+        });
+        return;
+    }
+    Object.values(activeProcesses).forEach((proc) => {
+        proc.stopping = true;
+    });
 });
 
 app.on('window-all-closed', () => {
@@ -6006,19 +6622,44 @@ app.on('window-all-closed', () => {
 });
 // Helpers (Same)
 function fetchJson(url) { return new Promise((resolve, reject) => { const req = https.get(url, { headers: { 'User-Agent': 'GeekEZ-Browser' } }, (res) => { let data = ''; res.on('data', c => data += c); res.on('end', () => { try { resolve(JSON.parse(data)); } catch (e) { reject(e); } }); }); req.on('error', reject); }); }
-function getLocalXrayVersion() { return new Promise((resolve) => { if (!fs.existsSync(BIN_PATH)) return resolve('v0.0.0'); try { const proc = spawn(BIN_PATH, ['-version']); let output = ''; proc.stdout.on('data', d => output += d.toString()); proc.on('close', () => { const match = output.match(/Xray\s+v?(\d+\.\d+\.\d+)/i); resolve(match ? (match[1].startsWith('v') ? match[1] : 'v' + match[1]) : 'v0.0.0'); }); proc.on('error', () => resolve('v0.0.0')); } catch (e) { resolve('v0.0.0'); } }); }
-function compareVersions(v1, v2) { const p1 = v1.split('.').map(Number); const p2 = v2.split('.').map(Number); for (let i = 0; i < 3; i++) { if ((p1[i] || 0) > (p2[i] || 0)) return 1; if ((p1[i] || 0) < (p2[i] || 0)) return -1; } return 0; }
+function getXrayVersion(binaryPath = BIN_PATH) {
+    return new Promise((resolve) => {
+        if (!binaryPath || !fs.existsSync(binaryPath)) return resolve('v0.0.0');
+        try {
+            const processRef = spawn(binaryPath, ['-version'], { windowsHide: true });
+            let output = '';
+            processRef.stdout.on('data', data => output += data.toString());
+            processRef.stderr.on('data', data => output += data.toString());
+            processRef.on('close', () => {
+                const match = output.match(/Xray\s+v?(\d+\.\d+\.\d+)/i);
+                resolve(match ? `v${match[1]}` : 'v0.0.0');
+            });
+            processRef.on('error', () => resolve('v0.0.0'));
+        } catch (e) {
+            resolve('v0.0.0');
+        }
+    });
+}
+function getLocalXrayVersion() { return getXrayVersion(BIN_PATH); }
+function compareVersions(v1, v2) { const p1 = String(v1 || '').replace(/^v/i, '').split('.').map(Number); const p2 = String(v2 || '').replace(/^v/i, '').split('.').map(Number); for (let i = 0; i < 3; i++) { if ((p1[i] || 0) > (p2[i] || 0)) return 1; if ((p1[i] || 0) < (p2[i] || 0)) return -1; } return 0; }
 function downloadFile(url, dest, onProgress) {
     return new Promise((resolve, reject) => {
-        const file = fs.createWriteStream(dest);
-        https.get(url, (response) => {
+        const request = (requestUrl) => https.get(requestUrl, (response) => {
             if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
-                downloadFile(response.headers.location, dest, onProgress).then(resolve).catch(reject);
+                response.resume();
+                request(response.headers.location);
+                return;
+            }
+
+            if (response.statusCode < 200 || response.statusCode >= 300) {
+                response.resume();
+                reject(new Error(`Failed to download: HTTP ${response.statusCode}`));
                 return;
             }
 
             const total = Number(response.headers['content-length'] || 0);
             let downloaded = 0;
+            const file = fs.createWriteStream(dest);
             if (typeof onProgress === 'function' && total > 0) {
                 onProgress(0);
             }
@@ -6030,14 +6671,20 @@ function downloadFile(url, dest, onProgress) {
                 }
             });
 
+            response.on('error', error => file.destroy(error));
             response.pipe(file);
+            file.on('error', error => {
+                try { fs.unlinkSync(dest); } catch (e) { }
+                reject(error);
+            });
             file.on('finish', () => {
                 try { file.close(resolve); } catch (e) { resolve(); }
             });
-        }).on('error', (err) => {
-            fs.unlink(dest, () => { });
-            reject(err);
+        }).on('error', (error) => {
+            try { fs.unlinkSync(dest); } catch (e) { }
+            reject(error);
         });
+        request(url);
     });
 }
 function extractZip(zipPath, destDir) {

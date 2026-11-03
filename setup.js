@@ -201,8 +201,8 @@ async function main() {
             xrayVersion = await getLatestXrayVersion(!isGlobal);
             console.log(`📦 Latest version: ${xrayVersion}`);
         } catch (e) {
-            console.log('⚠️  Failed to get latest version, using fallback: v26.3.27');
-            xrayVersion = 'v26.3.27';
+            console.log('⚠️  Failed to get latest version, using fallback: v26.10.31');
+            xrayVersion = 'v26.10.31';
         }
 
         const baseUrl = `https://github.com/XTLS/Xray-core/releases/download/${xrayVersion}/${xrayAsset}`;
@@ -236,8 +236,6 @@ async function main() {
 
         // 2. 准备 Chrome
         process.stdout.write('⬇️  Downloading Chrome...\n');
-        const { install } = require('@puppeteer/browsers');
-        const BUILD_ID = '147.0.7727.50';
         const DOWNLOAD_ROOT = path.join(__dirname, 'resources', 'puppeteer');
         const MIRROR_URL = 'https://npmmirror.com/mirrors/chrome-for-testing';
 
@@ -245,6 +243,26 @@ async function main() {
             console.log(`🧹 Cleaning existing Chrome directory...`);
             fs.rmSync(DOWNLOAD_ROOT, { recursive: true, force: true });
         }
+
+        if (os.platform() === 'linux' && os.arch() === 'arm64') {
+            const buildId = '153.0.8010.5';
+            const archivePath = path.join(DOWNLOAD_ROOT, 'chrome-linux-arm64.zip');
+            const installPath = path.join(DOWNLOAD_ROOT, 'chrome', `linux_arm64-${buildId}`);
+            const downloadUrl = `https://storage.googleapis.com/chrome-for-testing-public/${buildId}/linux-arm64/chrome-linux-arm64.zip`;
+            fs.ensureDirSync(installPath);
+            console.log(`⬇️  Downloading Chrome Beta ARM64 ${buildId}...`);
+            await downloadFile(downloadUrl, archivePath, 'Chrome ARM64');
+            await extractZip(archivePath, installPath);
+            fs.unlinkSync(archivePath);
+            fs.chmodSync(path.join(installPath, 'chrome-linux-arm64', 'chrome'), '755');
+            console.log(`✅ Chrome Beta ARM64 downloaded successfully!`);
+            console.log(`📂 Install Path: ${path.join(installPath, 'chrome-linux-arm64', 'chrome')}`);
+            console.log('✨ All Setup Completed...');
+            process.exit(0);
+        }
+
+        const { install } = require('@puppeteer/browsers');
+        const BUILD_ID = '150.0.7871.115';
 
         const baseUrlChrome = isGlobal ? undefined : MIRROR_URL;
 

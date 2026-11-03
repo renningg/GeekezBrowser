@@ -14,6 +14,10 @@ export const useSettingsStore = defineStore('settings', {
         apiStarting: false,
         watermarkStyle: 'enhanced',
         userExtensions: [],
+        defaultBookmarks: [],
+        defaultBookmarkScope: { mode: 'all', tags: [] },
+        defaultPasswords: [],
+        defaultPasswordScope: { mode: 'all', tags: [] },
         currentDataPath: '',
         isDefaultDataPath: true,
         activeTab: 'extensions'
@@ -36,6 +40,43 @@ export const useSettingsStore = defineStore('settings', {
                 this.watermarkStyle = settings.watermarkStyle === 'banner' || settings.watermarkStyle === 'off'
                     ? settings.watermarkStyle
                     : 'enhanced';
+                this.defaultBookmarks = Array.isArray(settings.defaultBookmarks)
+                    ? settings.defaultBookmarks.map(item => ({
+                        id: String(item?.id || globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`),
+                        name: String(item?.name || ''),
+                        url: String(item?.url || '')
+                    }))
+                    : [];
+                const bookmarkScope = settings.defaultBookmarkScope && typeof settings.defaultBookmarkScope === 'object'
+                    ? settings.defaultBookmarkScope
+                    : {};
+                this.defaultBookmarkScope = {
+                    mode: ['all', 'includeTags', 'excludeTags'].includes(bookmarkScope.mode) ? bookmarkScope.mode : 'all',
+                    tags: Array.from(new Set((Array.isArray(bookmarkScope.tags) ? bookmarkScope.tags : [])
+                        .map(tag => String(tag || '').trim())
+                        .filter(Boolean)))
+                };
+                this.defaultPasswords = Array.isArray(settings.defaultPasswords)
+                    ? settings.defaultPasswords.map(item => ({
+                        id: String(item?.id || globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`),
+                        name: String(item?.name || ''),
+                        url: String(item?.url || ''),
+                        username: String(item?.username || ''),
+                        password: String(item?.password || ''),
+                        notes: String(item?.notes || ''),
+                        twoFactorEnabled: item?.twoFactorEnabled !== false && !!String(item?.twoFactorSecret || '').trim(),
+                        twoFactorSecret: String(item?.twoFactorSecret || '')
+                    }))
+                    : [];
+                const passwordScope = settings.defaultPasswordScope && typeof settings.defaultPasswordScope === 'object'
+                    ? settings.defaultPasswordScope
+                    : {};
+                this.defaultPasswordScope = {
+                    mode: ['all', 'includeTags', 'excludeTags'].includes(passwordScope.mode) ? passwordScope.mode : 'all',
+                    tags: Array.from(new Set((Array.isArray(passwordScope.tags) ? passwordScope.tags : [])
+                        .map(tag => String(tag || '').trim())
+                        .filter(Boolean)))
+                };
                 localStorage.setItem('geekez_watermark_style', this.watermarkStyle);
 
                 // Load API Status
@@ -69,30 +110,22 @@ export const useSettingsStore = defineStore('settings', {
 
         async toggleRemoteDebugging(enabled) {
             this.enableRemoteDebugging = enabled;
-            const settings = await ipcService.getSettings();
-            settings.enableRemoteDebugging = enabled;
-            await ipcService.saveSettings(settings);
+            await ipcService.saveSettings({ enableRemoteDebugging: enabled });
         },
 
         async toggleCustomArgs(enabled) {
             this.enableCustomArgs = enabled;
-            const settings = await ipcService.getSettings();
-            settings.enableCustomArgs = enabled;
-            await ipcService.saveSettings(settings);
+            await ipcService.saveSettings({ enableCustomArgs: enabled });
         },
 
         async toggleUaWebglModify(enabled) {
             this.enableUaWebglModify = enabled;
-            const settings = await ipcService.getSettings();
-            settings.enableUaWebglModify = enabled;
-            await ipcService.saveSettings(settings);
+            await ipcService.saveSettings({ enableUaWebglModify: enabled });
         },
 
         async toggleApiServer(enabled) {
             this.enableApiServer = enabled;
-            const settings = await ipcService.getSettings();
-            settings.enableApiServer = enabled;
-            await ipcService.saveSettings(settings);
+            await ipcService.saveSettings({ enableApiServer: enabled });
 
             if (enabled) {
                 this.apiStarting = true;
@@ -111,16 +144,12 @@ export const useSettingsStore = defineStore('settings', {
 
         async setCloseBehavior(mode) {
             this.closeBehavior = mode === 'quit' ? 'quit' : 'tray';
-            const settings = await ipcService.getSettings();
-            settings.closeBehavior = this.closeBehavior;
-            await ipcService.saveSettings(settings);
+            await ipcService.saveSettings({ closeBehavior: this.closeBehavior });
         },
 
         async saveApiPort(port) {
             this.apiPort = port;
-            const settings = await ipcService.getSettings();
-            settings.apiPort = port;
-            await ipcService.saveSettings(settings);
+            await ipcService.saveSettings({ apiPort: port });
 
             if (this.enableApiServer) {
                 await settingService.stopApiServer();
@@ -138,9 +167,48 @@ export const useSettingsStore = defineStore('settings', {
             const nextStyle = style === 'banner' || style === 'off' ? style : 'enhanced';
             this.watermarkStyle = nextStyle;
             localStorage.setItem('geekez_watermark_style', nextStyle);
-            const settings = await ipcService.getSettings();
-            settings.watermarkStyle = nextStyle;
-            await ipcService.saveSettings(settings);
+            await ipcService.saveSettings({ watermarkStyle: nextStyle });
+        },
+
+        async saveDefaultBookmarks(bookmarks, scope) {
+            const normalizedBookmarks = (Array.isArray(bookmarks) ? bookmarks : []).map(item => ({
+                id: String(item?.id || globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`),
+                name: String(item?.name || '').trim(),
+                url: String(item?.url || '').trim()
+            }));
+            const rawScope = scope && typeof scope === 'object' ? scope : {};
+            const normalizedScope = {
+                mode: ['all', 'includeTags', 'excludeTags'].includes(rawScope.mode) ? rawScope.mode : 'all',
+                tags: Array.from(new Set((Array.isArray(rawScope.tags) ? rawScope.tags : [])
+                    .map(tag => String(tag || '').trim())
+                    .filter(Boolean)))
+            };
+            await ipcService.saveSettings({ defaultBookmarks: normalizedBookmarks, defaultBookmarkScope: normalizedScope });
+            this.defaultBookmarks = normalizedBookmarks;
+            this.defaultBookmarkScope = normalizedScope;
+        },
+
+        async saveDefaultPasswords(passwords, scope) {
+            const normalizedPasswords = (Array.isArray(passwords) ? passwords : []).map(item => ({
+                id: String(item?.id || globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`),
+                name: String(item?.name || '').trim(),
+                url: String(item?.url || '').trim(),
+                username: String(item?.username || '').trim(),
+                password: String(item?.password || ''),
+                notes: String(item?.notes || '').trim(),
+                twoFactorEnabled: item?.twoFactorEnabled !== false && !!String(item?.twoFactorSecret || '').trim(),
+                twoFactorSecret: String(item?.twoFactorSecret || '').trim()
+            }));
+            const rawScope = scope && typeof scope === 'object' ? scope : {};
+            const normalizedScope = {
+                mode: ['all', 'includeTags', 'excludeTags'].includes(rawScope.mode) ? rawScope.mode : 'all',
+                tags: Array.from(new Set((Array.isArray(rawScope.tags) ? rawScope.tags : [])
+                    .map(tag => String(tag || '').trim())
+                    .filter(Boolean)))
+            };
+            await ipcService.saveSettings({ defaultPasswords: normalizedPasswords, defaultPasswordScope: normalizedScope });
+            this.defaultPasswords = normalizedPasswords;
+            this.defaultPasswordScope = normalizedScope;
         },
 
         async loadExtensions() {
